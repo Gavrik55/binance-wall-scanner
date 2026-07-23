@@ -1,7 +1,7 @@
 """
-Подключение к Binance-Futures-style биржам (combined stream WS + REST snapshot).
-AsterDEX клонирует протокол Binance один в один, поэтому обслуживается тем же
-классом — просто с другими базовыми адресами.
+Подключение к Binance-style рынкам (combined stream WS + REST snapshot).
+Binance/AsterDEX futures и spot обслуживаются тем же классом — просто с
+разными базовыми адресами и REST-путями.
 
 ВАЖНО (фикс race condition): желаемые стримы (_desired_streams) хранятся
 независимо от состояния соединения. При (пере)подключении начальный набор
@@ -25,11 +25,29 @@ EXCHANGES = {
         "label": "Binance",
         "ws_base": "wss://fstream.binance.com/stream",
         "rest_base": "https://fapi.binance.com",
+        "depth_path": "/fapi/v1/depth",
+        "exchange_info_path": "/fapi/v1/exchangeInfo",
+    },
+    "BINANCE SPOT": {
+        "label": "Binance Spot",
+        "ws_base": "wss://stream.binance.com:9443/stream",
+        "rest_base": "https://api.binance.com",
+        "depth_path": "/api/v3/depth",
+        "exchange_info_path": "/api/v3/exchangeInfo",
     },
     "ASTERDEX": {
         "label": "AsterDEX",
         "ws_base": "wss://fstream.asterdex.com/stream",
         "rest_base": "https://fapi.asterdex.com",
+        "depth_path": "/fapi/v1/depth",
+        "exchange_info_path": "/fapi/v1/exchangeInfo",
+    },
+    "ASTERDEX SPOT": {
+        "label": "AsterDEX Spot",
+        "ws_base": "wss://sstream.asterdex.com/stream",
+        "rest_base": "https://sapi.asterdex.com",
+        "depth_path": "/api/v1/depth",
+        "exchange_info_path": "/api/v1/exchangeInfo",
     },
 }
 
@@ -203,16 +221,16 @@ class ExchangeWSManager:
 
 
 def fetch_depth_snapshot(exchange: str, symbol: str, limit: int = 1000) -> dict:
-    rest_base = EXCHANGES[exchange]["rest_base"]
-    url = f"{rest_base}/fapi/v1/depth"
+    cfg = EXCHANGES[exchange]
+    url = f"{cfg['rest_base']}{cfg['depth_path']}"
     resp = requests.get(url, params={"symbol": symbol.upper(), "limit": limit}, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
 
 def validate_symbol(exchange: str, symbol: str) -> bool:
-    rest_base = EXCHANGES[exchange]["rest_base"]
-    url = f"{rest_base}/fapi/v1/exchangeInfo"
+    cfg = EXCHANGES[exchange]
+    url = f"{cfg['rest_base']}{cfg['exchange_info_path']}"
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()

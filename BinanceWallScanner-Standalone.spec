@@ -1,12 +1,34 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+import sys
+
+
+PYTHON_DIR = sys.base_prefix
+DLLS_DIR = os.path.join(PYTHON_DIR, 'DLLs')
+TKINTER_DIR = os.path.join(PYTHON_DIR, 'Lib', 'tkinter')
+RUNTIME_ROOT = os.environ.get('TCLTK_RUNTIME_DIR', r'C:\TMM_Cutter\runtime')
+TCL_DIR = os.environ.get('TCL_LIBRARY', os.path.join(RUNTIME_ROOT, 'tcl8.6'))
+TK_DIR = os.environ.get('TK_LIBRARY', os.path.join(RUNTIME_ROOT, 'tk8.6'))
+TKINTER_BINARIES = [
+    (os.path.join(DLLS_DIR, '_tkinter.pyd'), '.'),
+    (os.path.join(DLLS_DIR, 'tcl86t.dll'), '.'),
+    (os.path.join(DLLS_DIR, 'tk86t.dll'), '.'),
+]
+TKINTER_DATAS = [
+    (TKINTER_DIR, 'tkinter'),
+    (TCL_DIR, '_tcl_data'),
+    (TK_DIR, '_tk_data'),
+    ('sounds', 'sounds'),
+]
+
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=[('sounds', 'sounds')],
-    hiddenimports=[],
+    binaries=TKINTER_BINARIES,
+    datas=TKINTER_DATAS,
+    hiddenimports=['_tkinter'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

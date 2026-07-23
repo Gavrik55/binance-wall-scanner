@@ -23,9 +23,11 @@ app = guimod.App(root)
 
 # --- 1) наполняем разными настройками и экспортируем ---
 app._add_symbol("BTCUSDT", 100000, "LONG", exchange="BINANCE", mode="FIXED", silent=True,
-                 threshold_max=150000, max_distance_pct=5.0)
+                 threshold_max=150000, max_distance_pct=5.0, single_confirm_sec=0.5,
+                 exact_exchange=True)
 app._add_symbol("ETHUSDT", 50000, "SHORT", exchange="GATE", mode="AUTO", silent=True, muted=True,
-                 max_distance_pct=20.0)
+                 max_distance_pct=20.0, single_confirm_sec=3.0,
+                 exact_exchange=True)
 
 guimod.filedialog.asksaveasfilename = lambda **kw: export_path
 app._export_config()
@@ -36,9 +38,13 @@ with open(export_path, encoding="utf-8") as f:
 by_symbol = {item["symbol"]: item for item in exported}
 assert by_symbol["BTCUSDT"]["threshold_max"] == 150000.0
 assert by_symbol["BTCUSDT"]["max_distance_pct"] == 5.0
+assert by_symbol["BTCUSDT"]["single_confirm_sec"] == 0.5
+assert "comment" not in by_symbol["BTCUSDT"]
 assert by_symbol["ETHUSDT"]["mode"] == "AUTO"
 assert by_symbol["ETHUSDT"]["muted"] is True
 assert by_symbol["ETHUSDT"]["max_distance_pct"] == 20.0
+assert by_symbol["ETHUSDT"]["single_confirm_sec"] == 3.0
+assert "comment" not in by_symbol["ETHUSDT"]
 assert messages[-1][0] == "info"
 print("OK: экспорт сохранил все настройки (диапазон, дистанция, режим, muted) корректно")
 
@@ -60,14 +66,17 @@ cfg_btc = app2.detector.configs["BINANCE:BTCUSDT"]
 cfg_eth = app2.detector.configs["GATE:ETHUSDT"]
 assert cfg_btc.threshold_max_usd == 150000.0
 assert cfg_btc.max_distance_pct == 5.0
+assert cfg_btc.single_confirm_sec == 0.5
 assert cfg_eth.mode == "AUTO"
 assert cfg_eth.max_distance_pct == 20.0
+assert cfg_eth.single_confirm_sec == 3.0
 assert "GATE:ETHUSDT" in app2.muted_keys
 assert messages[-1][0] == "info"
 print("OK: импорт в 'новую версию' приложения корректно перенёс все монеты со всеми настройками")
 
 # --- 3) импорт ДОБАВЛЯЕТ к уже существующим, не стирая их ---
-app2._add_symbol("SOLUSDT", 30000, "LONG", exchange="OKX", mode="FIXED", silent=True)
+app2._add_symbol("SOLUSDT", 30000, "LONG", exchange="OKX", mode="FIXED", silent=True,
+                 exact_exchange=True)
 assert "OKX:SOLUSDT" in app2.orderbooks
 app2._import_config()  # повторный импорт того же файла
 assert "OKX:SOLUSDT" in app2.orderbooks, "существующая монета не должна пропасть после импорта"

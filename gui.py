@@ -14,7 +14,7 @@ from datetime import datetime
 
 from orderbook import OrderBook
 from debug_log import log as dlog
-from detector import WallDetector, SymbolConfig, format_age
+from detector import WallDetector, SymbolConfig, format_age, NEAR_SPREAD_PCT
 from ws_manager import ExchangeWSManager, fetch_depth_snapshot, validate_symbol as binance_style_validate
 from gate_ws import GateWSManager, validate_symbol as gate_validate_symbol
 from okx_ws import OKXWSManager, validate_symbol as okx_validate_symbol
@@ -49,9 +49,28 @@ else:
     _RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 APPEARED_SOUND_PATH = os.path.join(_RESOURCE_DIR, "sounds", "Sound_07.wav")
 
-EXCHANGE_CHOICES = ["BINANCE", "ASTERDEX", "GATE", "OKX"]
-BINANCE_STYLE = {"BINANCE", "ASTERDEX"}  # эти биржи используют Binance-style diff (U/u/pu)
+BASE_EXCHANGE_CHOICES = ["BINANCE", "ASTERDEX", "GATE", "OKX"]
+SPOT_EXCHANGE_BY_BASE = {
+    "BINANCE": "BINANCE SPOT",
+    "ASTERDEX": "ASTERDEX SPOT",
+    "GATE": "GATE SPOT",
+    "OKX": "OKX SPOT",
+}
+EXCHANGE_CHOICES = BASE_EXCHANGE_CHOICES + list(SPOT_EXCHANGE_BY_BASE.values())
+BINANCE_STYLE = {"BINANCE", "ASTERDEX", "BINANCE SPOT", "ASTERDEX SPOT"}  # Binance-style diff (U/u/pu)
 ALL_EXCHANGES_LABEL = "🌐 ВСЕ БИРЖИ"  # спец-пункт в комбобоксе "Биржа" — добавить тикер сразу везде, где он есть
+MARKET_TOP_EXCHANGES = ["BINANCE", "ASTERDEX", "GATE", "OKX"]
+HEDGEHOG_EXCHANGES = ["BINANCE", "BYBIT", "BINANCE SPOT", "ASTERDEX SPOT", "GATE SPOT", "OKX SPOT"]
+EXCHANGE_SHORT_LABELS = {
+    "BINANCE": "BIN",
+    "BINANCE SPOT": "BIN S",
+    "ASTERDEX": "AST",
+    "ASTERDEX SPOT": "AST S",
+    "GATE": "GATE",
+    "GATE SPOT": "GATE S",
+    "OKX": "OKX",
+    "OKX SPOT": "OKX S",
+}
 
 # пресеты диапазона объёма плотности для выпадающего списка: (подпись, от, до).
 # "Вручную" ничего не подставляет — поля "от $"/"до $" заполняются самим
@@ -70,7 +89,16 @@ VOLUME_PRESETS = [
 _UNSET = object()  # сентинел: отличить "параметр не передан" от "передан явный None"
 
 # соответствие self.label каждого менеджера (человекочитаемое) -> наш внутренний ключ биржи
-LABEL_TO_EXCHANGE = {"Binance": "BINANCE", "AsterDEX": "ASTERDEX", "Gate.io": "GATE", "OKX": "OKX"}
+LABEL_TO_EXCHANGE = {
+    "Binance": "BINANCE",
+    "Binance Spot": "BINANCE SPOT",
+    "AsterDEX": "ASTERDEX",
+    "AsterDEX Spot": "ASTERDEX SPOT",
+    "Gate.io": "GATE",
+    "Gate.io Spot": "GATE SPOT",
+    "OKX": "OKX",
+    "OKX Spot": "OKX SPOT",
+}
 
 # состояние индикатора подключения -> (иконка, цвет, текст)
 CONN_STATE_DISPLAY = {
@@ -85,6 +113,7 @@ SIDE_COLOR = {"bid": "#22c55e", "ask": "#ef4444"}  # зелёный/красны
 EVENT_COLORS = {
     "APPEARED":  "#fbbf24",
     "MAGNET":    "#f59e0b",
+    "PUSH":      "#38bdf8",
     "EATEN":     "#34d399",
     "PULLED":    "#f87171",
     "WALL":      "#a78bfa",
@@ -94,6 +123,7 @@ EVENT_COLORS = {
 EVENT_LABELS = {
     "APPEARED":  "🟨 ПЛОТНОСТЬ",
     "MAGNET":    "🟧 МАГНИТ",
+    "PUSH":      "🟦 ПОД СПРЕДОМ",
     "EATEN":     "🟩 ПРОЕЛИ",
     "PULLED":    "🟥 СНЯЛИ",
     "WALL":      "🧱 СТЕНКА",
@@ -101,13 +131,35 @@ EVENT_LABELS = {
     "CASCADE":   "🟦🟦 КАСКАД",
 }
 BEEP_FREQ = {
-    "APPEARED": 700, "MAGNET": 1000, "EATEN": 500, "PULLED": 350,
+    "APPEARED": 700, "MAGNET": 1000, "PUSH": 1100, "EATEN": 500, "PULLED": 350,
     "WALL": 1200, "WALL_GONE": 400, "CASCADE": 1500, "IMPULSE": 850,
 }
 
 WALLS_PUSH_INTERVAL = 1.0
 MOVER_ADD_DEFAULT_FLOOR = 20_000  # порог-пол при добавлении монеты из "Топ движений" (режим AUTO)
 DEFAULT_MAX_DISTANCE_PCT = 10.0  # дефолт "Дистанция %" — совпадает с SymbolConfig.max_distance_pct
+MIN_DISTANCE_PCT = NEAR_SPREAD_PCT  # если пользователь вводит 0, ищем в минимальном практическом радиусе от спреда
+DEFAULT_SINGLE_CONFIRM_SEC = 10.0  # сколько секунд плотность должна прожить до алерта по умолчанию
+MIN_SINGLE_CONFIRM_SEC = 0.0  # 0 = без ожидания: алерт сразу на первом подходящем скане
+
+
+def _parse_decimal(value):
+    return float(str(value).strip().replace(",", "."))
+
+
+def _normalize_distance_pct(value):
+    value = _parse_decimal(value)
+    if 0 <= value < MIN_DISTANCE_PCT:
+        return MIN_DISTANCE_PCT
+    return value
+
+
+def _normalize_single_confirm_sec(value):
+    value = _parse_decimal(value)
+    if 0 <= value < MIN_SINGLE_CONFIRM_SEC:
+        return MIN_SINGLE_CONFIRM_SEC
+    return value
+
 
 IMPULSE_THRESHOLD_MIN_PCT = 0.1
 IMPULSE_THRESHOLD_MAX_PCT = 50.0
@@ -198,6 +250,7 @@ class App:
         # ЛЮБОЙ другой символ (см. _update_walls_tree)
         self._wall_row_seq = {}    # iid ("EXCH:SYMBOL|price") -> порядковый номер обнаружения
         self._next_wall_seq = 0
+        self._log_comment_editor = None
 
         # "Импульс" (вкладка "Топ движений") — всплывающие уведомления,
         # видимые независимо от активной вкладки. Порог/окно настраиваются
@@ -218,14 +271,15 @@ class App:
 
         # "Топ движений" — лёгкий REST-опрос всего рынка (не зависит от
         # Старт/Стоп сканера плотностей, работает всегда, пока открыто приложение)
-        self.market_scanner = MarketScanner(self._on_market_update, self._on_status)
+        self.market_scanner = MarketScanner(self._on_market_update, self._on_status,
+                                            exchanges=MARKET_TOP_EXCHANGES)
         self.market_scanner.impulse_window_sec = self.impulse_window_sec
         self.market_scanner.start()
 
-        # "Ерши" — узкий диапазон/частые касания границ на низком объёме,
-        # только Binance+Bybit (по просьбе, без Mexc и без остальных 3 бирж сканера)
+        # "Ерши" — узкий диапазон/частые касания границ на низком объёме.
+        # Оставляем старые futures-источники и добавляем spot-рынки.
         self.hedgehog_scanner = MarketScanner(self._on_hedgehog_update, self._on_status,
-                                               exchanges=["BINANCE", "BYBIT"])
+                                               exchanges=HEDGEHOG_EXCHANGES)
         self.hedgehog_scanner.start()
 
     # ---------------- UI ----------------
@@ -255,7 +309,7 @@ class App:
         top.pack(fill="x", padx=10, pady=(10, 4))
 
         tk.Label(top, text="Биржа:", bg="#0a0a0d", fg="white").grid(row=0, column=0, padx=4, sticky="w")
-        self.exchange_combo = ttk.Combobox(top, values=EXCHANGE_CHOICES + [ALL_EXCHANGES_LABEL],
+        self.exchange_combo = ttk.Combobox(top, values=BASE_EXCHANGE_CHOICES + [ALL_EXCHANGES_LABEL],
                                             width=13, state="readonly")
         self.exchange_combo.set("BINANCE")
         self.exchange_combo.grid(row=0, column=1, padx=4)
@@ -294,6 +348,12 @@ class App:
         self.max_distance_entry = tk.Entry(top, width=9)
         self.max_distance_entry.insert(0, str(DEFAULT_MAX_DISTANCE_PCT))
         self.max_distance_entry.grid(row=1, column=3, padx=4, pady=(6, 0), sticky="w")
+
+        tk.Label(top, text="Жизнь, с:", bg="#0a0a0d", fg="white").grid(
+            row=1, column=4, padx=(14, 4), pady=(6, 0), sticky="w")
+        self.single_confirm_entry = tk.Entry(top, width=9)
+        self.single_confirm_entry.insert(0, str(DEFAULT_SINGLE_CONFIRM_SEC))
+        self.single_confirm_entry.grid(row=1, column=5, padx=4, pady=(6, 0), sticky="w")
 
         top2 = tk.Frame(tab_scanner, bg="#0a0a0d")
         top2.pack(fill="x", padx=10, pady=(0, 8))
@@ -334,21 +394,23 @@ class App:
         # колонка всё равно стоит рядом с "От $" — за это отвечает
         # displaycolumns ниже, который переставляет порядок ТОЛЬКО в отображении.
         cols = ("exchange", "symbol", "mode", "threshold", "live_threshold",
-                "direction", "bid", "ask", "walls", "alerts", "threshold_max", "max_distance_pct")
+                "direction", "bid", "ask", "walls", "alerts", "threshold_max",
+                "max_distance_pct", "single_confirm_sec")
         headers = {"exchange": "Биржа", "symbol": "Символ", "mode": "Режим",
                    "threshold": "От $", "live_threshold": "Тек. порог $",
                    "direction": "Напр.", "bid": "Best Bid", "ask": "Best Ask",
                    "walls": "Плотностей", "alerts": "Алерты", "threshold_max": "До $",
-                   "max_distance_pct": "Дист. %"}
-        widths = {"exchange": 80, "symbol": 120, "mode": 70, "threshold": 90,
+                   "max_distance_pct": "Дист. %", "single_confirm_sec": "Жизнь с"}
+        widths = {"exchange": 120, "symbol": 120, "mode": 70, "threshold": 90,
                   "live_threshold": 110, "direction": 70, "bid": 100, "ask": 100,
-                  "walls": 80, "alerts": 90, "threshold_max": 90, "max_distance_pct": 70}
+                  "walls": 80, "alerts": 90, "threshold_max": 90, "max_distance_pct": 70,
+                  "single_confirm_sec": 70}
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=6)
         for c in cols:
             self.tree.heading(c, text=headers[c])
             self.tree.column(c, width=widths[c], anchor="center")
         self.tree["displaycolumns"] = ("exchange", "symbol", "mode", "threshold", "threshold_max",
-                                        "max_distance_pct", "live_threshold", "direction",
+                                        "max_distance_pct", "single_confirm_sec", "live_threshold", "direction",
                                         "bid", "ask", "walls", "alerts")
         tree_scroll = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=tree_scroll.set)
@@ -358,13 +420,13 @@ class App:
 
         walls_frame = tk.Frame(tab_scanner, bg="#0a0a0d")
         walls_frame.pack(fill="x", padx=10, pady=(8, 4))
-        tk.Label(walls_frame, text="Активные плотности (возраст / дистанция от цены)",
+        tk.Label(walls_frame, text="Активные плотности (возраст / дистанция от спреда)",
                  bg="#0a0a0d", fg="white", font=("Segoe UI", 11, "bold")).pack(anchor="w")
 
         wcols = ("exchange", "symbol", "side", "price", "usd", "age", "dist")
         wheaders = {"exchange": "Биржа", "symbol": "Символ", "side": "Сторона", "price": "Цена",
                     "usd": "Размер $", "age": "Возраст", "dist": "Дистанция"}
-        wwidths = {"exchange": 90, "symbol": 130, "side": 90, "price": 100,
+        wwidths = {"exchange": 120, "symbol": 130, "side": 130, "price": 100,
                    "usd": 110, "age": 90, "dist": 100}
         self.walls_tree = ttk.Treeview(walls_frame, columns=wcols, show="headings", height=5)
         for c in wcols:
@@ -381,22 +443,22 @@ class App:
         tk.Label(bottom, text="Лента алертов", bg="#0a0a0d", fg="white",
                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
 
-        lcols = ("time", "exchange", "symbol", "side", "price", "event", "details")
+        lcols = ("time", "exchange", "symbol", "side", "price", "event", "details", "comment")
         lheaders = {"time": "Время", "exchange": "Биржа", "symbol": "Символ", "side": "Сторона",
-                    "price": "Цена", "event": "Событие", "details": "Детали"}
-        lwidths = {"time": 70, "exchange": 90, "symbol": 120, "side": 90,
-                   "price": 90, "event": 140, "details": 420}
+                    "price": "Цена", "event": "Событие", "details": "Детали", "comment": "Комментарий"}
+        lwidths = {"time": 70, "exchange": 120, "symbol": 120, "side": 90,
+                   "price": 90, "event": 130, "details": 300, "comment": 240}
         self.log = ttk.Treeview(bottom, columns=lcols, show="headings")
         for c in lcols:
             self.log.heading(c, text=lheaders[c])
-            self.log.column(c, width=lwidths[c], anchor="center" if c != "details" else "w")
+            self.log.column(c, width=lwidths[c], anchor="center" if c not in ("details", "comment") else "w")
         for kind, color in EVENT_COLORS.items():
             self.log.tag_configure(kind, foreground=color)
         log_scroll = ttk.Scrollbar(bottom, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=log_scroll.set)
         self.log.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
-        self.log.bind("<Double-1>", lambda e: self._copy_symbol_from_tree(self.log, 2))
+        self.log.bind("<Double-1>", self._on_log_double_click)
 
         self._build_movers_tab(tab_movers)
         self._build_hedgehog_tab(tab_hedgehog)
@@ -407,19 +469,20 @@ class App:
         status_bar.pack(fill="x", side="bottom")
 
         conn_frame = tk.Frame(self.root, bg="#0a0a0d")
-        conn_frame.pack(fill="x", side="bottom", padx=10, pady=4)
+        conn_frame.pack(fill="x", side="bottom", padx=10, pady=(1, 1))
         tk.Label(conn_frame, text="Подключение:", bg="#0a0a0d", fg="#9aa0a6",
-                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 8))
+                 font=("Segoe UI", 8)).pack(side="left", padx=(0, 4))
         self.conn_labels = {}
         for exch in EXCHANGE_CHOICES:
-            lbl = tk.Label(conn_frame, text=f"{exch}: ⚪ —", bg="#0a0a0d", fg="#6b7078",
-                           font=("Segoe UI", 9, "bold"), padx=6)
-            lbl.pack(side="left", padx=4)
+            short = EXCHANGE_SHORT_LABELS.get(exch, exch)
+            lbl = tk.Label(conn_frame, text=f"{short}: ⚪ —", bg="#0a0a0d", fg="#6b7078",
+                           font=("Segoe UI", 8, "bold"), padx=3)
+            lbl.pack(side="left", padx=(0, 5))
             self.conn_labels[exch] = lbl
 
     def _build_movers_tab(self, parent):
         """Вкладка «Топ движений»: топ-20 роста и топ-20 падения за 24ч по
-        всем 4 биржам сразу (лёгкий REST-опрос всего рынка, market_scan.py —
+        фьючерсным/линейным источникам без spot (лёгкий REST-опрос всего рынка, market_scan.py —
         никаких REST-снапшотов/WS per-символ, поэтому это не грузит биржи так,
         как подписка на стакан). Двойной клик по строке — сразу добавляет
         монету в сканер плотностей (режим AUTO)."""
@@ -462,7 +525,7 @@ class App:
         mheaders = {"exchange": "Биржа", "symbol": "Символ", "last": "Цена",
                     "change": "24ч %", "impulse": self._impulse_column_title(),
                     "volume": "Объём $"}
-        mwidths = {"exchange": 85, "symbol": 130, "last": 100, "change": 90,
+        mwidths = {"exchange": 120, "symbol": 130, "last": 100, "change": 90,
                    "impulse": 100, "volume": 110}
 
         def make_movers_tree(container, title):
@@ -492,12 +555,12 @@ class App:
     def _build_hedgehog_tab(self, parent):
         """Вкладка «Ерши»: узкий боковой диапазон + частые касания обеих
         границ на низком объёме — типичный паттерн на неликвидных монетах
-        перед резким движением. Только Binance+Bybit (по просьбе). Считается
+        перед резким движением. Считается
         из той же скользящей истории тикеров, что и «Топ движений» — никаких
         дополнительных REST-запросов, только окно шире (90 мин вместо 3)."""
         hint = tk.Label(parent,
                          text=f"Диапазон/касания за последние {int(HEDGEHOG_WINDOW_SEC / 60)} мин, "
-                              f"только Binance+Bybit. Чем уже диапазон — тем выше в списке. "
+                              f"Binance/Bybit + spot-рынки. Чем уже диапазон — тем выше в списке. "
                               f"Первые {int(HEDGEHOG_WINDOW_SEC / 60)} мин после запуска — прогрев "
                               "(строк не будет, копится история).",
                          bg="#0a0a0d", fg="#6b7078", font=("Segoe UI", 9))
@@ -507,7 +570,7 @@ class App:
         hheaders = {"exchange": "Биржа", "symbol": "Символ", "last": "Цена",
                     "range": "Диапазон %", "touch_top": "Touch верх", "touch_bot": "Touch низ",
                     "vol60": "Объём 60м $", "vol10": "Объём 10м $"}
-        hwidths = {"exchange": 85, "symbol": 130, "last": 100, "range": 100,
+        hwidths = {"exchange": 120, "symbol": 130, "last": 100, "range": 100,
                    "touch_top": 90, "touch_bot": 90, "vol60": 110, "vol10": 110}
 
         frame = tk.Frame(parent, bg="#0a0a0d")
@@ -537,9 +600,51 @@ class App:
                 self.threshold_max_entry.insert(0, str(hi))
             return
 
+    def _base_exchange_for(self, exchange):
+        exchange = (exchange or "").upper()
+        if exchange.endswith(" SPOT"):
+            base = exchange[:-5]
+            if base in BASE_EXCHANGE_CHOICES:
+                return base
+        return exchange
+
+    @staticmethod
+    def _symbol_display(exchange, symbol):
+        symbol = (symbol or "").upper()
+        exchange = (exchange or "").upper()
+        return f"{symbol} SPOT" if exchange.endswith(" SPOT") else symbol
+
+    @staticmethod
+    def _symbol_from_display(symbol):
+        symbol = (symbol or "").strip().upper()
+        return symbol[:-5].strip() if symbol.endswith(" SPOT") else symbol
+
+    @staticmethod
+    def _side_display(side):
+        return "низ" if side == "bid" else "верх"
+
+    def _exchange_targets_for_selection(self, exchange):
+        exchange = (exchange or "").upper()
+        if exchange == ALL_EXCHANGES_LABEL.upper():
+            return EXCHANGE_CHOICES, "всех биржах"
+        base = self._base_exchange_for(exchange)
+        if base in BASE_EXCHANGE_CHOICES:
+            return [base, SPOT_EXCHANGE_BY_BASE[base]], base
+        return [exchange], exchange
+
+    def _config_targets_for_exchange(self, exchange):
+        """Old configs saved only the base exchange; load them as futures + spot."""
+        exchange = (exchange or "BINANCE").upper()
+        if exchange == ALL_EXCHANGES_LABEL.upper():
+            return list(EXCHANGE_CHOICES)
+        if exchange in BASE_EXCHANGE_CHOICES:
+            return [exchange, SPOT_EXCHANGE_BY_BASE[exchange]]
+        return [exchange]
+
     def _add_symbol(self, symbol=None, threshold=None, direction=None, exchange=None,
                      mode=None, muted=False, silent=False, threshold_max=_UNSET,
-                     max_distance_pct=_UNSET):
+                     max_distance_pct=_UNSET, single_confirm_sec=_UNSET,
+                     exact_exchange=False):
         symbol = (symbol or self.symbol_entry.get()).strip().upper()
         if not symbol:
             return
@@ -573,7 +678,7 @@ class App:
             raw_dist = self.max_distance_entry.get().strip() if not silent else ""
             raw_dist = raw_dist or str(DEFAULT_MAX_DISTANCE_PCT)
             try:
-                max_distance_pct = float(raw_dist)
+                max_distance_pct = _normalize_distance_pct(raw_dist)
             except (ValueError, TypeError):
                 if not silent:
                     messagebox.showerror("Ошибка", "«Дистанция %» должна быть числом")
@@ -582,12 +687,33 @@ class App:
             max_distance_pct = DEFAULT_MAX_DISTANCE_PCT
         else:
             try:
-                max_distance_pct = float(max_distance_pct)
+                max_distance_pct = _normalize_distance_pct(max_distance_pct)
             except (ValueError, TypeError):
                 max_distance_pct = DEFAULT_MAX_DISTANCE_PCT
-        if max_distance_pct <= 0:
+        if max_distance_pct < 0:
             if not silent:
-                messagebox.showerror("Ошибка", "«Дистанция %» должна быть больше нуля")
+                messagebox.showerror("Ошибка", "«Дистанция %» не может быть меньше нуля")
+            return
+
+        if single_confirm_sec is _UNSET:
+            raw_life = self.single_confirm_entry.get().strip() if not silent else ""
+            raw_life = raw_life or str(DEFAULT_SINGLE_CONFIRM_SEC)
+            try:
+                single_confirm_sec = _normalize_single_confirm_sec(raw_life)
+            except (ValueError, TypeError):
+                if not silent:
+                    messagebox.showerror("Ошибка", "«Жизнь, с» должна быть числом")
+                return
+        elif single_confirm_sec is None:
+            single_confirm_sec = DEFAULT_SINGLE_CONFIRM_SEC
+        else:
+            try:
+                single_confirm_sec = _normalize_single_confirm_sec(single_confirm_sec)
+            except (ValueError, TypeError):
+                single_confirm_sec = DEFAULT_SINGLE_CONFIRM_SEC
+        if single_confirm_sec < 0:
+            if not silent:
+                messagebox.showerror("Ошибка", "«Жизнь, с» не может быть меньше нуля")
             return
 
         direction = direction or self.direction_combo.get()
@@ -596,9 +722,12 @@ class App:
         if mode not in ("FIXED", "AUTO"):
             mode = "FIXED"
 
-        if exchange == ALL_EXCHANGES_LABEL.upper():
+        if not exact_exchange and (exchange == ALL_EXCHANGES_LABEL.upper()
+                                   or self._base_exchange_for(exchange) in BASE_EXCHANGE_CHOICES):
+            exchanges, target_label = self._exchange_targets_for_selection(exchange)
             self._add_symbol_all_exchanges(symbol, threshold, threshold_max, direction, mode,
-                                            max_distance_pct)
+                                            max_distance_pct, single_confirm_sec,
+                                            exchanges, target_label)
             return
 
         if exchange not in EXCHANGE_CHOICES:
@@ -607,7 +736,8 @@ class App:
             return
 
         cfg = SymbolConfig(symbol, threshold, direction, exchange=exchange, mode=mode,
-                            threshold_max_usd=threshold_max, max_distance_pct=max_distance_pct)
+                            threshold_max_usd=threshold_max, max_distance_pct=max_distance_pct,
+                            single_confirm_sec=single_confirm_sec)
         self.detector.set_config(cfg)
 
         key = f"{exchange}:{symbol}"
@@ -616,13 +746,14 @@ class App:
         alerts_display = "🔇 Выкл" if key in self.muted_keys else "🔔 Вкл"
         threshold_max_display = "-" if threshold_max is None else f"{threshold_max:,.0f}"
         max_distance_display = f"{max_distance_pct:g}"
+        single_confirm_display = f"{single_confirm_sec:g}"
 
         if key not in self.orderbooks:
             self.orderbooks[key] = OrderBook(symbol)
             self.tree.insert("", "end", iid=key,
                               values=(exchange, symbol, mode, f"{threshold:,.0f}", "-",
                                       direction, "-", "-", 0, alerts_display, threshold_max_display,
-                                      max_distance_display))
+                                      max_distance_display, single_confirm_display))
             if self.ws_managers:
                 self._ensure_manager(exchange)
                 threading.Thread(target=self._validate_and_subscribe,
@@ -630,7 +761,7 @@ class App:
         else:
             self.tree.item(key, values=(exchange, symbol, mode, f"{threshold:,.0f}", "-",
                                          direction, "-", "-", 0, alerts_display, threshold_max_display,
-                                         max_distance_display))
+                                         max_distance_display, single_confirm_display))
 
         self._save_config()
         self.symbol_entry.delete(0, "end")
@@ -641,29 +772,36 @@ class App:
         # перетекла бы на следующую добавленную по умолчанию
         self.max_distance_entry.delete(0, "end")
         self.max_distance_entry.insert(0, str(DEFAULT_MAX_DISTANCE_PCT))
+        self.single_confirm_entry.delete(0, "end")
+        self.single_confirm_entry.insert(0, str(DEFAULT_SINGLE_CONFIRM_SEC))
 
     def _add_symbol_all_exchanges(self, symbol, threshold, threshold_max, direction, mode,
-                                   max_distance_pct):
-        """«🌐 ВСЕ БИРЖИ»: проверяет тикер на каждой из 4 бирж в фоне (сетевые
-        запросы — не подвешиваем UI) и добавляет только туда, где он реально
-        торгуется, молча пропуская остальные — без диалогов об ошибке на
-        каждую отсутствующую биржу."""
+                                   max_distance_pct, single_confirm_sec,
+                                   exchanges=None, target_label=None):
+        """Проверяет тикер на наборе конкретных рынков в фоне и добавляет
+        только туда, где он реально торгуется. Так обычный выбор BINANCE
+        превращается в BINANCE + BINANCE SPOT без отдельного выбора рынка."""
+        exchanges = list(exchanges or EXCHANGE_CHOICES)
+        target_label = target_label or "всех биржах"
         self.symbol_entry.delete(0, "end")
         self.threshold_entry.delete(0, "end")
         self.threshold_max_entry.delete(0, "end")
         self.max_distance_entry.delete(0, "end")
         self.max_distance_entry.insert(0, str(DEFAULT_MAX_DISTANCE_PCT))
-        self.status_var.set(f"Проверяю {symbol} на всех биржах...")
+        self.single_confirm_entry.delete(0, "end")
+        self.single_confirm_entry.insert(0, str(DEFAULT_SINGLE_CONFIRM_SEC))
+        self.status_var.set(f"Проверяю {symbol} на {target_label}...")
         threading.Thread(
             target=self._validate_all_exchanges_worker,
-            args=(symbol, threshold, threshold_max, direction, mode, max_distance_pct),
+            args=(symbol, threshold, threshold_max, direction, mode, max_distance_pct,
+                  single_confirm_sec, exchanges, target_label),
             daemon=True,
         ).start()
 
     def _validate_all_exchanges_worker(self, symbol, threshold, threshold_max, direction, mode,
-                                        max_distance_pct):
+                                        max_distance_pct, single_confirm_sec, exchanges, target_label):
         found = []
-        for exchange in EXCHANGE_CHOICES:
+        for exchange in exchanges:
             try:
                 ok = self._validator_for(exchange)(symbol)
             except Exception:
@@ -673,13 +811,15 @@ class App:
                 self.root.after(0, lambda exch=exchange: self._add_symbol(
                     symbol, threshold, direction, exchange=exch, mode=mode,
                     silent=True, threshold_max=threshold_max, max_distance_pct=max_distance_pct,
+                    single_confirm_sec=single_confirm_sec,
+                    exact_exchange=True,
                 ))
         if found:
             self.root.after(0, lambda: self.status_var.set(
                 f"{symbol} добавлен на: {', '.join(found)}"))
         else:
             self.root.after(0, lambda: self.status_var.set(
-                f"⚠ {symbol} не найден ни на одной бирже"))
+                f"⚠ {symbol} не найден на {target_label}"))
 
     def _toggle_mute(self):
         sel = self.tree.selection()
@@ -720,7 +860,7 @@ class App:
             return
         key = sel[0]
         vals = self.tree.item(key, "values")
-        self.exchange_combo.set(vals[0])
+        self.exchange_combo.set(self._base_exchange_for(vals[0]))
         self.symbol_entry.delete(0, "end")
         self.symbol_entry.insert(0, vals[1])
         self.mode_combo.set(vals[2])
@@ -735,6 +875,9 @@ class App:
         dist = vals[11] if len(vals) > 11 else str(DEFAULT_MAX_DISTANCE_PCT)
         self.max_distance_entry.delete(0, "end")
         self.max_distance_entry.insert(0, dist or str(DEFAULT_MAX_DISTANCE_PCT))
+        life = vals[12] if len(vals) > 12 else str(DEFAULT_SINGLE_CONFIRM_SEC)
+        self.single_confirm_entry.delete(0, "end")
+        self.single_confirm_entry.insert(0, life or str(DEFAULT_SINGLE_CONFIRM_SEC))
         self._copy_symbol_to_clipboard(vals[1])
 
     def _copy_symbol_to_clipboard(self, symbol):
@@ -752,17 +895,86 @@ class App:
         vals = tree.item(sel[0], "values")
         if len(vals) <= symbol_index:
             return
-        self._copy_symbol_to_clipboard(vals[symbol_index])
+        self._copy_symbol_to_clipboard(self._symbol_from_display(vals[symbol_index]))
+
+    def _on_log_double_click(self, event):
+        self._close_log_comment_editor(save=True)
+        row = self.log.identify_row(event.y)
+        if not row:
+            return "break"
+        self.log.selection_set(row)
+
+        col_name = ""
+        for name in self.log["columns"]:
+            bbox = self.log.bbox(row, name)
+            if bbox and bbox[0] <= event.x < bbox[0] + bbox[2]:
+                col_name = name
+                break
+
+        if col_name == "comment":
+            self._edit_alert_comment(row)
+        else:
+            self._copy_symbol_from_tree(self.log, 2)
+        return "break"
+
+    def _set_alert_comment(self, row, comment):
+        if not self.log.exists(row):
+            return
+        columns = list(self.log["columns"])
+        comment_idx = columns.index("comment")
+        vals = list(self.log.item(row, "values"))
+        while len(vals) <= comment_idx:
+            vals.append("")
+        vals[comment_idx] = str(comment or "").strip()
+        self.log.item(row, values=vals)
+
+    def _edit_alert_comment(self, row):
+        if not self.log.exists(row):
+            return
+        columns = list(self.log["columns"])
+        comment_idx = columns.index("comment")
+        vals = list(self.log.item(row, "values"))
+        current = vals[comment_idx] if len(vals) > comment_idx else ""
+        bbox = self.log.bbox(row, "comment")
+        if not bbox:
+            return
+
+        editor = tk.Entry(self.log, bg="#f8fafc", fg="#111827",
+                          insertbackground="#111827", relief="solid", bd=1)
+        editor.insert(0, current)
+        editor.select_range(0, "end")
+        editor.icursor("end")
+        editor.place(x=bbox[0], y=bbox[1], width=bbox[2], height=bbox[3])
+        self._log_comment_editor = {"entry": editor, "row": row, "original": current}
+
+        editor.bind("<Return>", lambda _event: self._close_log_comment_editor(save=True))
+        editor.bind("<Escape>", lambda _event: self._close_log_comment_editor(save=False))
+        editor.bind("<FocusOut>", lambda _event: self._close_log_comment_editor(save=True))
+        editor.focus_set()
+
+    def _close_log_comment_editor(self, save=True):
+        editor_info = self._log_comment_editor
+        if not editor_info:
+            return "break"
+        self._log_comment_editor = None
+        entry = editor_info["entry"]
+        row = editor_info["row"]
+        if save:
+            self._set_alert_comment(row, entry.get())
+        elif self.log.exists(row):
+            self._set_alert_comment(row, editor_info["original"])
+        entry.destroy()
+        return "break"
 
     def _ensure_manager(self, exchange):
         if exchange in self.ws_managers:
             return
         if exchange in BINANCE_STYLE:
             mgr = ExchangeWSManager(exchange, self._on_depth_update, self._on_status)
-        elif exchange == "GATE":
-            mgr = GateWSManager(self._on_depth_update, self._on_status)
-        elif exchange == "OKX":
-            mgr = OKXWSManager(self._on_depth_update, self._on_status)
+        elif exchange.startswith("GATE"):
+            mgr = GateWSManager(self._on_depth_update, self._on_status, exchange=exchange)
+        elif exchange.startswith("OKX"):
+            mgr = OKXWSManager(self._on_depth_update, self._on_status, exchange=exchange)
         else:
             return
         self._update_conn_label(exchange, "connecting")
@@ -772,10 +984,10 @@ class App:
     def _validator_for(self, exchange):
         if exchange in BINANCE_STYLE:
             return lambda s: binance_style_validate(exchange, s)
-        if exchange == "GATE":
-            return gate_validate_symbol
-        if exchange == "OKX":
-            return okx_validate_symbol
+        if exchange.startswith("GATE"):
+            return lambda s: gate_validate_symbol(s, exchange=exchange)
+        if exchange.startswith("OKX"):
+            return lambda s: okx_validate_symbol(s, exchange=exchange)
         return lambda s: True
 
     def _validate_and_subscribe(self, exchange, symbol):
@@ -951,7 +1163,8 @@ class App:
         icon, color, text = CONN_STATE_DISPLAY.get(state, CONN_STATE_DISPLAY["idle"])
         lbl = self.conn_labels.get(exchange)
         if lbl:
-            lbl.config(text=f"{exchange}: {icon} {text}", fg=color)
+            short = EXCHANGE_SHORT_LABELS.get(exchange, exchange)
+            lbl.config(text=f"{short}: {icon} {text}", fg=color)
 
     # ---------------- очередь -> главный поток tkinter ----------------
 
@@ -991,10 +1204,11 @@ class App:
             return  # алерты выключены для этой пары; детекция в фоне продолжается как обычно
 
         ts = datetime.fromtimestamp(ev.ts).strftime("%H:%M:%S")
-        side_ru = "BID/низ" if ev.side == "bid" else "ASK/верх"
+        side_ru = self._side_display(ev.side)
         price_str = f"{ev.price:g}" if ev.price else "-"
-        self.log.insert("", 0, values=(ts, ev.exchange, ev.symbol, side_ru, price_str,
-                                        EVENT_LABELS[ev.kind], ev.extra), tags=(ev.kind,))
+        symbol_display = self._symbol_display(ev.exchange, ev.symbol)
+        self.log.insert("", 0, values=(ts, ev.exchange, symbol_display, side_ru, price_str,
+                                        EVENT_LABELS[ev.kind], ev.extra, ""), tags=(ev.kind,))
         children = self.log.get_children()
         if len(children) > 500:
             self.log.delete(children[-1])
@@ -1015,7 +1229,9 @@ class App:
 
         for w in snapshot:
             iid = f"{key}|{w['price']}"
-            side_ru = "BID/низ" if w["side"] == "bid" else "ASK/верх"
+            side_ru = self._side_display(w["side"])
+            if w.get("near_spread"):
+                side_ru = f"{side_ru}/у спреда"
             values = (exchange, symbol, side_ru, f"{w['price']:g}", f"${w['usd']:,.0f}",
                       format_age(w["age"]), f"{w['dist_pct']:.2f}%")
             if self.walls_tree.exists(iid):
@@ -1221,6 +1437,10 @@ class App:
         self.threshold_entry.delete(0, "end")
         self.threshold_entry.insert(0, str(MOVER_ADD_DEFAULT_FLOOR))
         self.threshold_max_entry.delete(0, "end")
+        self.max_distance_entry.delete(0, "end")
+        self.max_distance_entry.insert(0, str(DEFAULT_MAX_DISTANCE_PCT))
+        self.single_confirm_entry.delete(0, "end")
+        self.single_confirm_entry.insert(0, str(DEFAULT_SINGLE_CONFIRM_SEC))
         self._add_symbol()
         self.root.clipboard_clear()
         self.root.clipboard_append(symbol)
@@ -1257,9 +1477,14 @@ class App:
                     threshold_max = None
             dist_raw = vals[11] if len(vals) > 11 else DEFAULT_MAX_DISTANCE_PCT
             try:
-                max_distance_pct = float(dist_raw)
+                max_distance_pct = _normalize_distance_pct(dist_raw)
             except (ValueError, TypeError):
                 max_distance_pct = DEFAULT_MAX_DISTANCE_PCT
+            life_raw = vals[12] if len(vals) > 12 else DEFAULT_SINGLE_CONFIRM_SEC
+            try:
+                single_confirm_sec = _normalize_single_confirm_sec(life_raw)
+            except (ValueError, TypeError):
+                single_confirm_sec = DEFAULT_SINGLE_CONFIRM_SEC
             data.append({
                 "exchange": vals[0],
                 "symbol": vals[1],
@@ -1269,6 +1494,7 @@ class App:
                 "direction": vals[5],
                 "muted": key in self.muted_keys,
                 "max_distance_pct": max_distance_pct,
+                "single_confirm_sec": single_confirm_sec,
             })
         return data
 
@@ -1281,13 +1507,16 @@ class App:
         count = 0
         for item in data:
             try:
-                self._add_symbol(item["symbol"], item["threshold"], item["direction"],
-                                  exchange=item.get("exchange", "BINANCE"),
-                                  mode=item.get("mode", "FIXED"),
-                                  muted=item.get("muted", False), silent=True,
-                                  threshold_max=item.get("threshold_max"),
-                                  max_distance_pct=item.get("max_distance_pct"))
-                count += 1
+                for exchange in self._config_targets_for_exchange(item.get("exchange", "BINANCE")):
+                    self._add_symbol(item["symbol"], item["threshold"], item["direction"],
+                                      exchange=exchange,
+                                      mode=item.get("mode", "FIXED"),
+                                      muted=item.get("muted", False), silent=True,
+                                      threshold_max=item.get("threshold_max"),
+                                      max_distance_pct=item.get("max_distance_pct"),
+                                      single_confirm_sec=item.get("single_confirm_sec"),
+                                      exact_exchange=True)
+                    count += 1
             except Exception:
                 continue
         return count

@@ -39,6 +39,11 @@ assert "⚡" in vals[4]
 class FakeEvent:
     widget = app.gainers_tree
 app.gainers_tree.selection_set("BINANCE:AAAUSDT")
+orig_add_symbol = app._add_symbol
+def add_symbol_sync(*args, **kwargs):
+    kwargs["exact_exchange"] = True
+    return orig_add_symbol(*args, **kwargs)
+app._add_symbol = add_symbol_sync
 app._on_mover_double_click(FakeEvent())
 assert "BINANCE:AAAUSDT" in app.orderbooks, "монета должна была добавиться в сканер"
 cfg = app.detector.configs["BINANCE:AAAUSDT"]

@@ -65,6 +65,8 @@ import time
 from collections import deque
 
 
+NEAR_SPREAD_PCT = 0.01
+
 SIZE_LABELS = [
     (1_000_000, "🐋 ОГРОМНАЯ"),
     (500_000, "🔴 КРУПНАЯ"),
@@ -81,14 +83,17 @@ def size_label(usd: float) -> str:
 
 
 def format_age(seconds: float) -> str:
-    seconds = max(0, int(seconds))
+    seconds = max(0.0, float(seconds))
+    if seconds < 1.0:
+        return f"{seconds:.1f}с"
+    seconds = int(seconds)
     m, s = divmod(seconds, 60)
     return f"{m}:{s:02d}"
 
 
 class WallState:
     __slots__ = ("price", "side", "initial_qty", "current_qty", "max_qty",
-                 "first_seen", "magnet_fired", "confirmed", "is_baseline")
+                 "first_seen", "magnet_fired", "push_fired", "confirmed", "is_baseline")
 
     def __init__(self, price, qty, side, now):
         self.price = price
@@ -98,6 +103,7 @@ class WallState:
         self.max_qty = qty
         self.first_seen = now
         self.magnet_fired = False  # True = либо сработал магнит, либо окно закрылось
+        self.push_fired = False    # True = уже алертили, что плотность встала прямо у спреда
         self.confirmed = False     # True = простояла single_confirm_sec, алерт APPEARED уже отправлен
         # True = уже была в стакане на момент первого скана после запуска/
         # добавления символа — не "новая" плотность, поэтому НИКАКИХ алертов
@@ -137,7 +143,7 @@ class SymbolConfig:
         self.direction = direction  # LONG / SHORT / BOTH
         self.mode = mode  # "FIXED" / "AUTO"
         self.auto_multiplier = auto_multiplier
-        self.max_distance_pct = max_distance_pct  # диапазон для ОДИНОЧНЫХ плотностей
+        self.max_distance_pct = float(max_distance_pct)  # диапазон для ОДИНОЧНЫХ плотностей
 
         # окно [min;max] секунд после появления, в течение которого проверяем
         # магнит (реальное касание уровня ценой, см. scan())
@@ -148,7 +154,7 @@ class SymbolConfig:
         # не просесть ниже ALIVE_RATIO порога), прежде чем считается
         # подтверждённой и приходит алерт APPEARED. Если снялась раньше —
         # молча игнорируется как шум/спуф, без единого алерта
-        self.single_confirm_sec = single_confirm_sec
+        self.single_confirm_sec = max(0.0, float(single_confirm_sec))
 
         # стенка = wall_min_components и больше плотностей подряд, с зазором
         # между соседними не больше wall_cluster_gap_pct % от цены, и не дальше
@@ -284,6 +290,25 @@ class WallDetector:
             return None
         return max(cfg.threshold_usd, median * cfg.auto_multiplier)
 
+    @staticmethod
+    def _volume_in_filter(usd, threshold, cfg):
+        if usd < threshold:
+            return False
+        return cfg.threshold_max_usd is None or usd <= cfg.threshold_max_usd
+
+    @staticmethod
+    def _distance_from_spread_pct(side, price, best_bid, best_ask, mid):
+        if not mid or mid <= 0:
+            return float("inf")
+        edge = best_bid if side == "bid" else best_ask
+        if edge is None:
+            return float("inf")
+        return abs(edge - price) / mid * 100
+
+    @staticmethod
+    def _initial_scan_is_silent(exchange):
+        return not (exchange or "").upper().endswith(" SPOT")
+
     def scan(self, exchange, symbol, orderbook):
         events = []
         key = self._key(exchange, symbol)
@@ -301,15 +326,15 @@ class WallDetector:
         book_side = {"bid": orderbook.bids, "ask": orderbook.asks}
         best = {"bid": orderbook.best_bid(), "ask": orderbook.best_ask()}
 
-        def within_range(price):
-            return abs(mid - price) / mid * 100 <= cfg.max_distance_pct
+        def within_range(side, price):
+            return self._distance_from_spread_pct(side, price, best["bid"], best["ask"], mid) <= cfg.max_distance_pct
 
         # 0) AUTO: статистика "нормального" размера уровня (без уже-стенок, без дальних)
         if cfg.mode == "AUTO":
             baseline = self.baselines.setdefault(key, deque(maxlen=self.BASELINE_WINDOW))
             for side in sides:
                 for price, qty in book_side[side].items():
-                    if price in walls or not within_range(price):
+                    if price in walls or not within_range(side, price):
                         continue
                     baseline.append(price * qty)
 
@@ -324,6 +349,7 @@ class WallDetector:
         # что-то новое, поэтому по нему не будет вообще никаких алертов
         # (см. WallState.is_baseline и все проверки в шаге 2 ниже).
         is_baseline_tick = key not in self.first_scan_done
+        silent_initial_tick = is_baseline_tick and self._initial_scan_is_silent(exchange)
 
         # 1) новые плотности + обновление объёма существующих. ВАЖНО: алерт
         # APPEARED здесь больше НЕ отправляется — начинаем только отслеживать
@@ -336,7 +362,7 @@ class WallDetector:
         new_this_tick = []  # [(price, usd, side), ...]
         for side in sides:
             for price, qty in book_side[side].items():
-                if not within_range(price):
+                if not within_range(side, price):
                     continue
                 usd = price * qty
                 if usd < threshold:
@@ -345,7 +371,7 @@ class WallDetector:
                     continue  # режим "от-до": крупнее верхней границы — не считается
                 if price not in walls:
                     w = WallState(price, qty, side, now)
-                    w.is_baseline = is_baseline_tick
+                    w.is_baseline = silent_initial_tick
                     walls[price] = w
                     if not is_baseline_tick:
                         new_this_tick.append((price, usd, side))
@@ -386,21 +412,68 @@ class WallDetector:
             cur_qty = book_side[w.side].get(price, 0.0)
             w.current_qty = cur_qty
             age = now - w.first_seen
-            dist_pct_now = abs(mid - price) / mid * 100
+            dist_pct_now = self._distance_from_spread_pct(w.side, price, best["bid"], best["ask"], mid)
             b = best[w.side]
             # цена РЕАЛЬНО дошла/пересекла уровень плотности (не просто
             # приблизилась) — используется и магнитом, и определением EATEN/PULLED
             touched = (b is not None and b <= price) if w.side == "bid" else (b is not None and b >= price)
-            still_wall = (price * cur_qty) >= threshold * self.ALIVE_RATIO
+            usd_now = price * cur_qty
+            in_filter_now = self._volume_in_filter(usd_now, threshold, cfg)
+            over_max_now = cfg.threshold_max_usd is not None and usd_now > cfg.threshold_max_usd
 
             if w.is_baseline:
                 # была в стакане ещё до того, как мы начали следить — не
                 # "новая" плотность, поэтому НИКАКИХ алертов по ней: ни
                 # появления, ни магнита, ни съедено/снято. Просто убираем из
                 # отслеживания, когда её не станет (видна в UI, пока жива)
-                if not still_wall or dist_pct_now > cfg.max_distance_pct:
+                if not in_filter_now or dist_pct_now > cfg.max_distance_pct:
                     del walls[price]
                 continue
+
+            if not w.confirmed and not in_filter_now:
+                # До подтверждения плотность должна оставаться именно в
+                # выбранном пользователем диапазоне "от-до". Если она успела
+                # похудеть ниже "от $" или вырасти выше "до $", алерта о
+                # новой плотности быть не должно.
+                del walls[price]
+                continue
+
+            # Отдельный быстрый сигнал: подходящая по объёму плотность встала
+            # прямо у края спреда. Это именно сценарий "поджимает цену": bid
+            # под Best Bid для LONG / ask над Best Ask для SHORT. Не ждём
+            # single_confirm_sec, потому что такие заявки могут жить доли
+            # секунды и всё равно быть важными.
+            if not w.push_fired and dist_pct_now <= NEAR_SPREAD_PCT:
+                w.push_fired = True
+                usd_now = price * cur_qty
+                events.append(WallEvent(
+                    exchange, symbol, "PUSH", price, cur_qty, w.side,
+                    extra=f"${usd_now:,.0f} у спреда, дистанция {dist_pct_now:.3f}%, стоит {format_age(age)}"
+                ))
+
+            if w.confirmed:
+                if dist_pct_now > cfg.max_distance_pct:
+                    # унесло цену дальше max_distance_pct — просто перестаём
+                    # следить, без события (не съедено и не снято)
+                    del walls[price]
+                    continue
+                if over_max_now:
+                    # Пользователь ограничил "до $"; если уже подтверждённая
+                    # плотность разрослась выше этого диапазона, она больше
+                    # не соответствует фильтру. Убираем без PULLED/EATEN,
+                    # потому что её не сняли и не проели — она стала крупнее.
+                    del walls[price]
+                    continue
+                if usd_now < threshold:
+                    kind = "EATEN" if touched else "PULLED"
+                    max_usd = w.max_qty * price
+                    pct_left = (usd_now / max_usd * 100) if max_usd else 0
+                    events.append(WallEvent(
+                        exchange, symbol, kind, price, cur_qty, w.side,
+                        extra=f"было ${max_usd:,.0f}, осталось {pct_left:.0f}%, жила {format_age(age)}"
+                    ))
+                    del walls[price]
+                    continue
 
             # магнит проверяем НЕЗАВИСИМО от подтверждения одиночной плотности
             # (single_confirm_sec) — считается от первого обнаружения, а не от
@@ -424,7 +497,7 @@ class WallDetector:
                 # ещё не простояла cfg.single_confirm_sec — алерта о появлении
                 # ещё не было. Исчезла/просела раньше срока — молча забываем,
                 # без единого алерта (ни о появлении, ни о снятии): шум/спуф
-                if not still_wall or dist_pct_now > cfg.max_distance_pct:
+                if dist_pct_now > cfg.max_distance_pct:
                     del walls[price]
                     continue
                 if age >= cfg.single_confirm_sec:
@@ -437,21 +510,6 @@ class WallDetector:
                 continue
 
             # дальше — только для уже ПОДТВЕРЖДЁННЫХ плотностей (был алерт APPEARED)
-            if dist_pct_now > cfg.max_distance_pct:
-                # унесло цену дальше max_distance_pct — просто перестаём
-                # следить, без события (не съедено и не снято)
-                del walls[price]
-                continue
-
-            if not still_wall:
-                kind = "EATEN" if touched else "PULLED"
-                max_usd = w.max_qty * price
-                pct_left = (cur_qty * price / max_usd * 100) if max_usd else 0
-                events.append(WallEvent(
-                    exchange, symbol, kind, price, cur_qty, w.side,
-                    extra=f"было ${max_usd:,.0f}, осталось {pct_left:.0f}%, жила {format_age(age)}"
-                ))
-                del walls[price]
 
         # 3) кластеризация: несколько плотностей БЛИЗКОГО объёма (допуск
         #    wall_volume_tolerance_usd, $ а не %) рядом по цене = СТЕНКА,
@@ -496,7 +554,7 @@ class WallDetector:
                 still_present.add(pk)
                 raw_candidates.append((price, usd))
 
-            if is_baseline_tick:
+            if silent_initial_tick:
                 stable = raw_candidates  # без ожидания устойчивости — фиксируем как есть
             else:
                 stable = [(p, u) for p, u in raw_candidates
@@ -511,7 +569,7 @@ class WallDetector:
                         current_clusters.append({
                             "side": side, "min": min(member_prices), "max": max(member_prices),
                             "count": len(member_prices), "usd": usd_total,
-                            "baseline": is_baseline_tick,
+                            "baseline": silent_initial_tick,
                         })
 
         # кандидаты, пропавшие из стакана (снялись/просели/унесло по цене) —
@@ -552,11 +610,14 @@ class WallDetector:
         """Текущее состояние активных плотностей для UI: возраст и дистанция от цены."""
         key = self._key(exchange, symbol)
         mid = orderbook.mid()
+        best_bid = orderbook.best_bid()
+        best_ask = orderbook.best_ask()
         now = time.time()
         result = []
         for price, w in self.active_walls.get(key, {}).items():
-            dist_abs = abs(mid - price) if mid else 0.0
-            dist_pct = (dist_abs / mid * 100) if mid else 0.0
+            edge = best_bid if w.side == "bid" else best_ask
+            dist_abs = abs(edge - price) if edge is not None else 0.0
+            dist_pct = self._distance_from_spread_pct(w.side, price, best_bid, best_ask, mid)
             result.append({
                 "price": price,
                 "side": w.side,
@@ -564,5 +625,6 @@ class WallDetector:
                 "age": now - w.first_seen,
                 "dist_abs": dist_abs,
                 "dist_pct": dist_pct,
+                "near_spread": dist_pct <= NEAR_SPREAD_PCT,
             })
         return result

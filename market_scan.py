@@ -9,8 +9,11 @@
 REST-эндпоинт, отдающий тикеры сразу по всему рынку одним запросом:
 
   BINANCE/ASTERDEX: GET /fapi/v1/ticker/24hr            (без параметра symbol)
+  SPOT-клоны:       GET /api/v3|v1/ticker/24hr
   GATE:             GET /api/v4/futures/usdt/tickers
+  GATE SPOT:        GET /api/v4/spot/tickers
   OKX:              GET /api/v5/market/tickers?instType=SWAP
+  OKX SPOT:         GET /api/v5/market/tickers?instType=SPOT
   BYBIT:            GET /v5/market/tickers?category=linear
 
 Поэтому rate-лимиты тут не проблема (по одному запросу на биржу раз в
@@ -48,8 +51,11 @@ HISTORY_RETENTION_SEC = max(IMPULSE_WINDOW_SEC, HEDGEHOG_WINDOW_SEC, HEDGEHOG_VO
 
 REST_URLS = {
     "BINANCE": "https://fapi.binance.com/fapi/v1/ticker/24hr",
+    "BINANCE SPOT": "https://api.binance.com/api/v3/ticker/24hr",
     "ASTERDEX": "https://fapi.asterdex.com/fapi/v1/ticker/24hr",
+    "ASTERDEX SPOT": "https://sapi.asterdex.com/api/v1/ticker/24hr",
     "GATE": "https://fx-api.gateio.ws/api/v4/futures/usdt/tickers",
+    "GATE SPOT": "https://api.gateio.ws/api/v4/spot/tickers",
     "OKX": "https://www.okx.com/api/v5/market/tickers",
     "BYBIT": "https://api.bybit.com/v5/market/tickers",
 }
@@ -98,14 +104,37 @@ def _fetch_gate() -> list:
     return out
 
 
-def _fetch_okx() -> list:
-    resp = requests.get(REST_URLS["OKX"], params={"instType": "SWAP"}, timeout=10)
+def _fetch_gate_spot() -> list:
+    resp = requests.get(REST_URLS["GATE SPOT"], timeout=10)
+    resp.raise_for_status()
+    out = []
+    for item in resp.json():
+        pair = item.get("currency_pair", "")
+        if not pair.endswith("_USDT"):
+            continue
+        try:
+            symbol = pair.replace("_", "").upper()
+            out.append({
+                "exchange": "GATE SPOT",
+                "symbol": symbol,
+                "last": float(item["last"]),
+                "change_pct_24h": float(item.get("change_percentage", 0.0)),
+                "quote_volume": float(item.get("quote_volume", item.get("base_volume", 0.0))),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out
+
+
+def _fetch_okx(inst_type="SWAP", exchange="OKX") -> list:
+    resp = requests.get(REST_URLS["OKX"], params={"instType": inst_type}, timeout=10)
     resp.raise_for_status()
     data = resp.json()
     out = []
+    suffix = "-USDT-SWAP" if inst_type == "SWAP" else "-USDT"
     for item in data.get("data", []):
         inst_id = item.get("instId", "")
-        if not inst_id.endswith("-USDT-SWAP"):
+        if not inst_id.endswith(suffix):
             continue
         try:
             last = float(item["last"])
@@ -113,7 +142,7 @@ def _fetch_okx() -> list:
             change_pct = ((last - open24h) / open24h * 100) if open24h else 0.0
             symbol = inst_id.replace("-SWAP", "").replace("-", "").upper()
             out.append({
-                "exchange": "OKX",
+                "exchange": exchange,
                 "symbol": symbol,
                 "last": last,
                 "change_pct_24h": change_pct,
@@ -150,9 +179,13 @@ def _fetch_bybit() -> list:
 
 FETCHERS = {
     "BINANCE": lambda: _fetch_binance_style("BINANCE"),
+    "BINANCE SPOT": lambda: _fetch_binance_style("BINANCE SPOT"),
     "ASTERDEX": lambda: _fetch_binance_style("ASTERDEX"),
+    "ASTERDEX SPOT": lambda: _fetch_binance_style("ASTERDEX SPOT"),
     "GATE": _fetch_gate,
-    "OKX": _fetch_okx,
+    "GATE SPOT": _fetch_gate_spot,
+    "OKX": lambda: _fetch_okx("SWAP", "OKX"),
+    "OKX SPOT": lambda: _fetch_okx("SPOT", "OKX SPOT"),
     "BYBIT": _fetch_bybit,
 }
 
@@ -165,10 +198,9 @@ class MarketScanner:
     остальные колбэки в этом проекте, GUI должен сам передать результат в
     свою очередь, а не трогать Tk-виджеты напрямую отсюда.
 
-    exchanges=None — опрашивать все зарегистрированные в FETCHERS биржи
-    (используется вкладкой "Топ движений"). exchanges=["BINANCE","BYBIT"] —
-    только перечисленные (используется вкладкой "Ерши" — по просьбе
-    ограничиться этими двумя, без Mexc и без ASTERDEX/GATE/OKX)."""
+    exchanges=None — опрашивать все зарегистрированные в FETCHERS биржи.
+    В GUI список источников задаётся явно: "Топ движений" остаётся без spot,
+    а "Ерши" получают spot-рынки дополнительно."""
 
     def __init__(self, on_update, on_status=None, exchanges=None):
         self.on_update = on_update

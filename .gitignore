@@ -22,7 +22,11 @@ dist/
 *.exe
 debug.log
 *.log
+config.json
 impulse_settings.json
+screen-check-*.png
+debug_packs/
+.build_config_backup/
 
 # Local editor and OS files
 .idea/

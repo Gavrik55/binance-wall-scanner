@@ -53,6 +53,7 @@ app._update_walls_tree("BINANCE", "LABUSDT", [
 ])
 order4 = list(app.walls_tree.get_children())
 print("order after new LABUSDT wall:", order4)
+assert app.walls_tree.item("BINANCE:LABUSDT|0.1657", "values")[2] == "верх"
 assert order4[-1] == "BINANCE:LABUSDT|0.1657", "новая плотность должна встать в конец (нашлась последней)"
 assert order4[:len(order1)] == order1, "порядок ранее найденных не должен меняться"
 print("OK: новая плотность встаёт в конец, порядок остальных не ломается")

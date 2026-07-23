@@ -17,8 +17,26 @@ import time
 import requests
 import websockets
 
-WS_BASE = "wss://fx-ws.gateio.ws/v4/ws/usdt"
-REST_BASE = "https://fx-api.gateio.ws/api/v4/futures/usdt"
+GATE_CONFIGS = {
+    "GATE": {
+        "label": "Gate.io",
+        "ws_base": "wss://fx-ws.gateio.ws/v4/ws/usdt",
+        "rest_base": "https://fx-api.gateio.ws/api/v4/futures/usdt",
+        "channel": "futures.order_book_update",
+        "snapshot_symbol_param": "contract",
+        "validate_path": "/contracts/{symbol}",
+        "subscribe_depth_level": True,
+    },
+    "GATE SPOT": {
+        "label": "Gate.io Spot",
+        "ws_base": "wss://api.gateio.ws/ws/v4/",
+        "rest_base": "https://api.gateio.ws/api/v4/spot",
+        "channel": "spot.order_book_update",
+        "snapshot_symbol_param": "currency_pair",
+        "validate_path": "/currency_pairs/{symbol}",
+        "subscribe_depth_level": False,
+    },
+}
 DEPTH_FREQUENCY = "100ms"
 DEPTH_LEVEL = "100"
 
@@ -35,10 +53,29 @@ def from_gate_symbol(contract: str) -> str:
     return contract.replace("_", "").upper()
 
 
+def _extract_levels(levels):
+    out = []
+    for lvl in levels:
+        try:
+            if isinstance(lvl, dict):
+                out.append((lvl["p"], lvl["s"]))
+            else:
+                out.append((lvl[0], lvl[1]))
+        except (KeyError, IndexError, TypeError):
+            continue
+    return out
+
+
 class GateWSManager:
-    def __init__(self, on_depth_update, on_status):
-        self.exchange = "GATE"
-        self.label = "Gate.io"
+    def __init__(self, on_depth_update, on_status, exchange="GATE"):
+        cfg = GATE_CONFIGS[exchange]
+        self.exchange = exchange
+        self.label = cfg["label"]
+        self.ws_base = cfg["ws_base"]
+        self.rest_base = cfg["rest_base"]
+        self.channel = cfg["channel"]
+        self.snapshot_symbol_param = cfg["snapshot_symbol_param"]
+        self.subscribe_depth_level = cfg["subscribe_depth_level"]
         self.on_depth_update = on_depth_update  # callback(exchange, symbol, {"b":[(p,q)],"a":[(p,q)],"snapshot":bool})
         self.on_status = on_status
         self.loop = None
@@ -96,7 +133,7 @@ class GateWSManager:
         while not self._stop:
             try:
                 self.on_status(f"[{self.label}] Подключение...")
-                async with websockets.connect(WS_BASE, ping_interval=None) as ws:
+                async with websockets.connect(self.ws_base, ping_interval=None) as ws:
                     self.ws = ws
                     self.on_status(f"[{self.label}] Подключено")
                     backoff = 1
@@ -123,7 +160,7 @@ class GateWSManager:
                 msg = json.loads(raw)
             except Exception:
                 continue
-            if msg.get("channel") != "futures.order_book_update" or msg.get("event") != "update":
+            if msg.get("channel") != self.channel or msg.get("event") != "update":
                 continue
             result = msg.get("result") or {}
             contract = result.get("s")
@@ -151,8 +188,8 @@ class GateWSManager:
         state["last_id"] = u
         symbol = from_gate_symbol(contract)
         self.on_depth_update(self.exchange, symbol, {
-            "b": [(lvl["p"], lvl["s"]) for lvl in result.get("b", [])],
-            "a": [(lvl["p"], lvl["s"]) for lvl in result.get("a", [])],
+            "b": _extract_levels(result.get("b", [])),
+            "a": _extract_levels(result.get("a", [])),
         })
 
     def _ensure_bootstrap(self, contract, state):
@@ -178,8 +215,8 @@ class GateWSManager:
                 return
             try:
                 resp = requests.get(
-                    f"{REST_BASE}/order_book",
-                    params={"contract": contract, "limit": DEPTH_LEVEL, "with_id": "true"},
+                    f"{self.rest_base}/order_book",
+                    params={self.snapshot_symbol_param: contract, "limit": DEPTH_LEVEL, "with_id": "true"},
                     timeout=10,
                 )
                 resp.raise_for_status()
@@ -201,8 +238,8 @@ class GateWSManager:
         symbol = from_gate_symbol(contract)
         self.on_depth_update(self.exchange, symbol, {
             "snapshot": True,
-            "b": [(lvl["p"], lvl["s"]) for lvl in data.get("bids", [])],
-            "a": [(lvl["p"], lvl["s"]) for lvl in data.get("asks", [])],
+            "b": _extract_levels(data.get("bids", [])),
+            "a": _extract_levels(data.get("asks", [])),
         })
 
         buffer, state["buffer"] = state["buffer"], []
@@ -218,8 +255,8 @@ class GateWSManager:
                     continue
             state["last_id"] = u
             self.on_depth_update(self.exchange, symbol, {
-                "b": [(lvl["p"], lvl["s"]) for lvl in ev.get("b", [])],
-                "a": [(lvl["p"], lvl["s"]) for lvl in ev.get("a", [])],
+                "b": _extract_levels(ev.get("b", [])),
+                "a": _extract_levels(ev.get("a", [])),
             })
         if not applying:
             state["last_id"] = base_id
@@ -228,13 +265,16 @@ class GateWSManager:
 
     async def _subscribe(self, contract):
         if self.ws:
-            payload = {"time": int(time.time()), "channel": "futures.order_book_update",
-                       "event": "subscribe", "payload": [contract, DEPTH_FREQUENCY, DEPTH_LEVEL]}
+            args = [contract, DEPTH_FREQUENCY]
+            if self.subscribe_depth_level:
+                args.append(DEPTH_LEVEL)
+            payload = {"time": int(time.time()), "channel": self.channel,
+                       "event": "subscribe", "payload": args}
             await self.ws.send(json.dumps(payload))
 
     async def _unsubscribe(self, contract):
         if self.ws:
-            payload = {"time": int(time.time()), "channel": "futures.order_book_update",
+            payload = {"time": int(time.time()), "channel": self.channel,
                        "event": "unsubscribe", "payload": [contract, DEPTH_FREQUENCY]}
             await self.ws.send(json.dumps(payload))
 
@@ -244,10 +284,12 @@ class GateWSManager:
             await self.ws.close()
 
 
-def validate_symbol(symbol: str) -> bool:
+def validate_symbol(symbol: str, exchange="GATE") -> bool:
+    cfg = GATE_CONFIGS[exchange]
     contract = to_gate_symbol(symbol)
     try:
-        resp = requests.get(f"{REST_BASE}/contracts/{contract}", timeout=10)
+        path = cfg["validate_path"].format(symbol=contract)
+        resp = requests.get(f"{cfg['rest_base']}{path}", timeout=10)
         return resp.status_code == 200
     except Exception:
         return True

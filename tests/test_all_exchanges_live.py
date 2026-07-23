@@ -21,10 +21,13 @@ app._add_symbol()
 def check():
     print("orderbooks keys:", list(app.orderbooks.keys()))
     print("status_var:", app.status_var.get())
-    assert len(app.orderbooks) == 4, f"BTCUSDT должен найтись на всех 4 биржах (реальная сеть), получено {len(app.orderbooks)}"
+    assert len(app.orderbooks) == len(guimod.EXCHANGE_CHOICES), (
+        f"BTCUSDT должен найтись на всех futures+spot рынках (реальная сеть), "
+        f"получено {len(app.orderbooks)}"
+    )
     for exch in guimod.EXCHANGE_CHOICES:
         assert f"{exch}:BTCUSDT" in app.orderbooks
-    print("OK: BTCUSDT добавлен на все 4 реальные биржи через живую валидацию")
+    print("OK: BTCUSDT добавлен на все реальные futures+spot рынки через живую валидацию")
     root.destroy()
 
 
