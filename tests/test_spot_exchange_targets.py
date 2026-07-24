@@ -23,15 +23,17 @@ import gui
 
 app = object.__new__(gui.App)
 
-assert gui.BASE_EXCHANGE_CHOICES == ["BINANCE", "ASTERDEX", "GATE", "OKX"]
+assert gui.BASE_EXCHANGE_CHOICES == ["BINANCE", "ASTERDEX", "GATE", "OKX", "MEXC"]
 assert "BINANCE SPOT" in gui.EXCHANGE_CHOICES
 assert "OKX SPOT" in gui.EXCHANGE_CHOICES
+assert "MEXC SPOT" in gui.EXCHANGE_CHOICES
+assert "BINANCE ALPHA" in gui.EXCHANGE_CHOICES
 print("OK: concrete exchange list contains futures and spot markets")
 
 targets, label = app._exchange_targets_for_selection("BINANCE")
-assert targets == ["BINANCE", "BINANCE SPOT"]
+assert targets == ["BINANCE"]
 assert label == "BINANCE"
-print("OK: selecting BINANCE targets futures + spot")
+print("OK: selecting BINANCE targets only the futures market")
 
 targets, label = app._exchange_targets_for_selection(gui.ALL_EXCHANGES_LABEL)
 assert targets == gui.EXCHANGE_CHOICES
@@ -42,9 +44,9 @@ assert app._base_exchange_for("ASTERDEX SPOT") == "ASTERDEX"
 assert app._base_exchange_for("GATE") == "GATE"
 print("OK: editing spot rows maps back to base exchange in UI")
 
-assert app._config_targets_for_exchange("BINANCE") == ["BINANCE", "BINANCE SPOT"]
+assert app._config_targets_for_exchange("BINANCE") == ["BINANCE"]
 assert app._config_targets_for_exchange("BINANCE SPOT") == ["BINANCE SPOT"]
-print("OK: old saved base exchange rows expand to futures + spot on load")
+print("OK: saved rows load as exact markets")
 
 calls = []
 app._add_symbol = lambda symbol, threshold, direction, **kwargs: calls.append(
@@ -61,10 +63,10 @@ count = app._apply_config_data([{
     "max_distance_pct": 7,
     "single_confirm_sec": 0.2,
 }])
-assert count == 2
-assert [call[3]["exchange"] for call in calls] == ["OKX", "OKX SPOT"]
+assert count == 1
+assert [call[3]["exchange"] for call in calls] == ["OKX"]
 assert all(call[3]["exact_exchange"] for call in calls)
 assert all(call[3]["single_confirm_sec"] == 0.2 for call in calls)
-print("OK: config import/load applies base rows to both concrete markets")
+print("OK: config import/load applies exact markets")
 
 print("\nALL SPOT EXCHANGE TARGET TESTS PASSED")

@@ -41,7 +41,7 @@ events = det.scan("BINANCE", "TESTUSDT", ob_eaten)
 magnet = [e for e in events if e.kind == "MAGNET"]
 assert len(magnet) == 1
 print("MAGNET extra:", magnet[0].extra)
-assert "$100,000" in magnet[0].extra, magnet[0].extra  # осталось
-assert "$100,000" in magnet[0].extra.split("(")[1], magnet[0].extra  # съедено тоже 100к (200к-100к)
+assert "$100к" in magnet[0].extra, magnet[0].extra  # осталось
+assert "$100к" in magnet[0].extra.split("(")[1], magnet[0].extra  # съедено тоже 100к (200к-100к)
 assert "50%" in magnet[0].extra, magnet[0].extra
 print("ALL MAGNET VOLUME TESTS PASSED")

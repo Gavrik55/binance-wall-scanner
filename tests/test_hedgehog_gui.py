@@ -12,8 +12,8 @@ if os.path.exists(guimod.CONFIG_FILE):
 root = tk.Tk()
 app = guimod.App(root)
 print("App created OK, tabs:", app.notebook.tabs())
-assert app.hedgehog_scanner._fetchers.keys() == {"BINANCE", "BYBIT"}, app.hedgehog_scanner._fetchers.keys()
-print("OK: hedgehog_scanner ограничен BINANCE+BYBIT")
+assert set(app.hedgehog_scanner._fetchers.keys()) == set(guimod.HEDGEHOG_EXCHANGES), app.hedgehog_scanner._fetchers.keys()
+print("OK: hedgehog_scanner использует текущий список бирж Ершей")
 
 fake_tickers = [
     {"exchange": "BINANCE", "symbol": "TIGHTUSDT", "last": 1.0, "hh_ready": True,

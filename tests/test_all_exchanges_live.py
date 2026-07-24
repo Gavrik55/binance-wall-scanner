@@ -21,13 +21,14 @@ app._add_symbol()
 def check():
     print("orderbooks keys:", list(app.orderbooks.keys()))
     print("status_var:", app.status_var.get())
-    assert len(app.orderbooks) == len(guimod.EXCHANGE_CHOICES), (
-        f"BTCUSDT должен найтись на всех futures+spot рынках (реальная сеть), "
+    expected = [exch for exch in guimod.EXCHANGE_CHOICES if exch != "BINANCE ALPHA"]
+    assert len(app.orderbooks) >= len(expected), (
+        f"BTCUSDT должен найтись на обычных futures+spot рынках (реальная сеть), "
         f"получено {len(app.orderbooks)}"
     )
-    for exch in guimod.EXCHANGE_CHOICES:
+    for exch in expected:
         assert f"{exch}:BTCUSDT" in app.orderbooks
-    print("OK: BTCUSDT добавлен на все реальные futures+spot рынки через живую валидацию")
+    print("OK: BTCUSDT добавлен на обычные реальные futures+spot рынки через живую валидацию")
     root.destroy()
 
 

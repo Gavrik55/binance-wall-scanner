@@ -12,12 +12,28 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 
+from audit_log import AuditCsvWriter
 from orderbook import OrderBook
 from debug_log import log as dlog
 from detector import WallDetector, SymbolConfig, format_age, NEAR_SPREAD_PCT
-from ws_manager import ExchangeWSManager, fetch_depth_snapshot, validate_symbol as binance_style_validate
+from trade_tape import TradeTape
+from ws_manager import (
+    EXCHANGES as BINANCE_WS_CONFIGS,
+    ExchangeWSManager,
+    fetch_depth_snapshot,
+    validate_symbol as binance_style_validate,
+)
 from gate_ws import GateWSManager, validate_symbol as gate_validate_symbol
 from okx_ws import OKXWSManager, validate_symbol as okx_validate_symbol
+from rest_poll_manager import (
+    REST_EXCHANGES,
+    RestPollingManager,
+    alpha_display_symbol,
+    fetch_alpha_search_symbols,
+    fetch_rest_symbols,
+    resolve_alpha_symbol,
+    validate_rest_symbol,
+)
 from market_scan import (
     MarketScanner,
     POLL_INTERVAL_SEC as MARKET_POLL_INTERVAL_SEC,
@@ -49,27 +65,43 @@ else:
     _RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 APPEARED_SOUND_PATH = os.path.join(_RESOURCE_DIR, "sounds", "Sound_07.wav")
 
-BASE_EXCHANGE_CHOICES = ["BINANCE", "ASTERDEX", "GATE", "OKX"]
+BASE_EXCHANGE_CHOICES = ["BINANCE", "ASTERDEX", "GATE", "OKX", "MEXC"]
 SPOT_EXCHANGE_BY_BASE = {
     "BINANCE": "BINANCE SPOT",
     "ASTERDEX": "ASTERDEX SPOT",
     "GATE": "GATE SPOT",
     "OKX": "OKX SPOT",
+    "MEXC": "MEXC SPOT",
 }
-EXCHANGE_CHOICES = BASE_EXCHANGE_CHOICES + list(SPOT_EXCHANGE_BY_BASE.values())
+EXTRA_EXCHANGE_CHOICES = ["BINANCE ALPHA"]
+EXCHANGE_CHOICES = BASE_EXCHANGE_CHOICES + list(SPOT_EXCHANGE_BY_BASE.values()) + EXTRA_EXCHANGE_CHOICES
 BINANCE_STYLE = {"BINANCE", "ASTERDEX", "BINANCE SPOT", "ASTERDEX SPOT"}  # Binance-style diff (U/u/pu)
+REST_POLLING_EXCHANGES = set(REST_EXCHANGES)
+TRADE_TAPE_EXCHANGES = {"BINANCE", "BINANCE SPOT"}
 ALL_EXCHANGES_LABEL = "🌐 ВСЕ БИРЖИ"  # спец-пункт в комбобоксе "Биржа" — добавить тикер сразу везде, где он есть
 MARKET_TOP_EXCHANGES = ["BINANCE", "ASTERDEX", "GATE", "OKX"]
 HEDGEHOG_EXCHANGES = ["BINANCE", "BYBIT", "BINANCE SPOT", "ASTERDEX SPOT", "GATE SPOT", "OKX SPOT"]
 EXCHANGE_SHORT_LABELS = {
     "BINANCE": "BIN",
     "BINANCE SPOT": "BIN S",
+    "BINANCE ALPHA": "ALPHA",
     "ASTERDEX": "AST",
     "ASTERDEX SPOT": "AST S",
     "GATE": "GATE",
     "GATE SPOT": "GATE S",
     "OKX": "OKX",
     "OKX SPOT": "OKX S",
+    "MEXC": "MEXC",
+    "MEXC SPOT": "MEXC S",
+}
+CTRL_MASK = 0x0004
+HOTKEY_KEYCODES = {
+    "C": {67},
+    "DELETE": {46, 110},
+}
+HOTKEY_KEYSYMS = {
+    "C": {"c", "с", "cyrillic_es"},
+    "DELETE": {"delete", "kp_delete"},
 }
 
 # пресеты диапазона объёма плотности для выпадающего списка: (подпись, от, до).
@@ -98,6 +130,9 @@ LABEL_TO_EXCHANGE = {
     "Gate.io Spot": "GATE SPOT",
     "OKX": "OKX",
     "OKX Spot": "OKX SPOT",
+    "MEXC": "MEXC",
+    "MEXC Spot": "MEXC SPOT",
+    "Binance Alpha": "BINANCE ALPHA",
 }
 
 # состояние индикатора подключения -> (иконка, цвет, текст)
@@ -130,6 +165,16 @@ EVENT_LABELS = {
     "WALL_GONE": "🧱💨 РАССЕЯЛАСЬ",
     "CASCADE":   "🟦🟦 КАСКАД",
 }
+ALERT_FILTERS = [
+    ("APPEARED", "Плотн."),
+    ("PUSH", "Под спред"),
+    ("MAGNET", "Магнит"),
+    ("EATEN", "Проели"),
+    ("PULLED", "Сняли"),
+    ("WALL", "Стенка"),
+    ("WALL_GONE", "Ст. ушла"),
+    ("CASCADE", "Каскад"),
+]
 BEEP_FREQ = {
     "APPEARED": 700, "MAGNET": 1000, "PUSH": 1100, "EATEN": 500, "PULLED": 350,
     "WALL": 1200, "WALL_GONE": 400, "CASCADE": 1500, "IMPULSE": 850,
@@ -161,6 +206,55 @@ def _normalize_single_confirm_sec(value):
     return value
 
 
+def _format_compact_usd(value):
+    value = float(value or 0)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    def _trim(num):
+        text = f"{num:.1f}"
+        return text[:-2] if text.endswith(".0") else text
+    if value >= 1_000_000:
+        return f"{sign}${_trim(value / 1_000_000)}м"
+    if value >= 1_000:
+        return f"{sign}${_trim(value / 1_000)}к"
+    return f"{sign}${value:.0f}"
+
+
+def _parse_compact_usd(value):
+    text = str(value or "").strip().lower()
+    if not text or text == "-":
+        return None
+    multiplier = 1.0
+    text = text.replace("$", "").replace(" ", "")
+    if text.endswith(("к", "k")):
+        multiplier = 1_000.0
+        text = text[:-1]
+    elif text.endswith(("м", "m")):
+        multiplier = 1_000_000.0
+        text = text[:-1]
+    if "," in text and "." not in text:
+        left, right = text.rsplit(",", 1)
+        text = f"{left}.{right}" if len(right) <= 2 else f"{left}{right}"
+    else:
+        text = text.replace(",", "")
+    return float(text) * multiplier
+
+
+def _normalize_symbol_input(symbol, exchange=None):
+    symbol = str(symbol or "").strip().upper()
+    if not symbol:
+        return ""
+    symbol = symbol.replace("/", "").replace("-", "")
+    exchange = (exchange or "").upper()
+    if exchange == "BINANCE ALPHA":
+        return resolve_alpha_symbol(symbol)
+    symbol = symbol.replace("_", "")
+    quote_assets = ("USDT", "USDC", "FDUSD", "BTC", "ETH", "BNB")
+    if not any(symbol.endswith(q) for q in quote_assets):
+        symbol = f"{symbol}USDT"
+    return symbol
+
+
 IMPULSE_THRESHOLD_MIN_PCT = 0.1
 IMPULSE_THRESHOLD_MAX_PCT = 50.0
 IMPULSE_WINDOW_MIN_SEC = 30.0
@@ -168,6 +262,13 @@ IMPULSE_WINDOW_MAX_SEC = 1800.0  # 30 мин — с запасом ниже HIST
 IMPULSE_TOAST_MS = 8000          # сколько всплывающее окно висит перед авто-закрытием
 IMPULSE_TOAST_W, IMPULSE_TOAST_H = 280, 58
 IMPULSE_SETTINGS_FILE = os.path.join(_APP_DIR, "impulse_settings.json")  # отдельный файл — config.json это список монет, а не dict настроек
+PRINT_SETTINGS_FILE = os.path.join(_APP_DIR, "print_settings.json")
+REPEATING_PRINT_MIN_COUNT = 3
+DEFAULT_PRINT_WINDOW_SEC = 5.0
+DEFAULT_PRINT_SIMILARITY_PCT = 15.0
+DEFAULT_PRINT_MIN_USD = 0.0
+DEFAULT_PRINT_MAX_USD = None
+MAX_PRINT_ROWS = 200
 
 
 _CHIME_CACHE = {}  # freq -> готовый WAV (bytes), чтобы не пересинтезировать на каждый алерт
@@ -251,6 +352,21 @@ class App:
         self._wall_row_seq = {}    # iid ("EXCH:SYMBOL|price") -> порядковый номер обнаружения
         self._next_wall_seq = 0
         self._log_comment_editor = None
+        self._alert_rows = []
+        self._alert_row_kinds = {}
+        self._next_alert_seq = 0
+        self._copy_notice_after_id = None
+        self._symbol_suggestion_set = set()
+        self._symbol_suggestion_lock = threading.Lock()
+        self._symbol_suggestion_refreshing = False
+        self.audit_writer = AuditCsvWriter(_APP_DIR)
+        self.audit_enabled = tk.BooleanVar(value=False)
+        self.trade_tape = TradeTape()
+        self.print_window_sec = DEFAULT_PRINT_WINDOW_SEC
+        self.print_similarity_pct = DEFAULT_PRINT_SIMILARITY_PCT
+        self.print_min_usd = DEFAULT_PRINT_MIN_USD
+        self.print_max_usd = DEFAULT_PRINT_MAX_USD
+        self._load_print_settings()
 
         # "Импульс" (вкладка "Топ движений") — всплывающие уведомления,
         # видимые независимо от активной вкладки. Порог/окно настраиваются
@@ -265,7 +381,10 @@ class App:
         self._load_impulse_settings()
 
         self._build_ui()
+        self.root.bind_all("<KeyPress>", self._on_global_keypress, add="+")
         self._load_config()
+        self._seed_symbol_suggestions_from_rows()
+        self._refresh_symbol_suggestions_async()
         self.root.after(100, self._poll_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -309,14 +428,31 @@ class App:
         top.pack(fill="x", padx=10, pady=(10, 4))
 
         tk.Label(top, text="Биржа:", bg="#0a0a0d", fg="white").grid(row=0, column=0, padx=4, sticky="w")
-        self.exchange_combo = ttk.Combobox(top, values=BASE_EXCHANGE_CHOICES + [ALL_EXCHANGES_LABEL],
-                                            width=13, state="readonly")
+        self.exchange_combo = ttk.Combobox(top, values=EXCHANGE_CHOICES + [ALL_EXCHANGES_LABEL],
+                                            width=16, state="readonly")
         self.exchange_combo.set("BINANCE")
         self.exchange_combo.grid(row=0, column=1, padx=4)
+        self.exchange_combo.bind("<<ComboboxSelected>>", self._on_exchange_selected)
 
         tk.Label(top, text="Символ:", bg="#0a0a0d", fg="white").grid(row=0, column=2, padx=4, sticky="w")
         self.symbol_entry = tk.Entry(top, width=14)
         self.symbol_entry.grid(row=0, column=3, padx=4)
+        self.symbol_entry.bind("<KeyRelease>", self._on_symbol_keyrelease)
+        self.symbol_entry.bind("<Down>", self._focus_symbol_suggestions)
+        self.symbol_entry.bind("<Return>", self._accept_symbol_entry_or_add)
+        self.symbol_entry.bind("<Escape>", lambda _e: self._hide_symbol_suggestions())
+
+        self.symbol_suggest_popup = tk.Toplevel(self.root)
+        self.symbol_suggest_popup.withdraw()
+        self.symbol_suggest_popup.overrideredirect(True)
+        self.symbol_suggest_popup.configure(bg="#111827")
+        self.symbol_suggest = tk.Listbox(self.symbol_suggest_popup, height=6, width=20, bg="#111827", fg="white",
+                                         selectbackground="#2563eb", activestyle="none",
+                                         highlightthickness=1, highlightbackground="#374151")
+        self.symbol_suggest.pack(fill="both", expand=True)
+        self.symbol_suggest.bind("<ButtonRelease-1>", self._choose_symbol_suggestion)
+        self.symbol_suggest.bind("<Return>", self._choose_symbol_suggestion)
+        self.symbol_suggest.bind("<Escape>", lambda _e: self._hide_symbol_suggestions())
 
         tk.Label(top, text="Объём:", bg="#0a0a0d", fg="white").grid(row=0, column=4, padx=4, sticky="w")
         self.volume_preset_combo = ttk.Combobox(top, values=[p[0] for p in VOLUME_PRESETS],
@@ -337,11 +473,6 @@ class App:
         self.mode_combo = ttk.Combobox(top, values=["FIXED", "AUTO"], width=8, state="readonly")
         self.mode_combo.set("FIXED")
         self.mode_combo.grid(row=0, column=11, padx=4)
-
-        tk.Label(top, text="Направление:", bg="#0a0a0d", fg="white").grid(row=0, column=12, padx=4, sticky="w")
-        self.direction_combo = ttk.Combobox(top, values=["LONG", "SHORT", "BOTH"], width=8, state="readonly")
-        self.direction_combo.set("LONG")
-        self.direction_combo.grid(row=0, column=13, padx=4)
 
         tk.Label(top, text="Дистанция % (от спреда до плотности):", bg="#0a0a0d", fg="white").grid(
             row=1, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
@@ -373,16 +504,22 @@ class App:
                                     bg="#0a0a0d", fg="white", selectcolor="#131316",
                                     activebackground="#0a0a0d", activeforeground="white")
         sound_chk.grid(row=0, column=4, padx=4)
-
         tk.Button(top2, text="💾 Экспорт конфига", command=self._export_config,
                   bg="#1f1f24", fg="white", relief="flat", padx=8).grid(row=0, column=5, padx=(12, 4))
         tk.Button(top2, text="📂 Импорт конфига", command=self._import_config,
                   bg="#1f1f24", fg="white", relief="flat", padx=8).grid(row=0, column=6, padx=4)
+        self.audit_btn = tk.Button(top2, text="csv", command=self._toggle_audit,
+                                    bg="#0a0a0d", fg="#343842", activebackground="#0a0a0d",
+                                    activeforeground="#737883", relief="flat", bd=0,
+                                    highlightthickness=0, padx=2, pady=0, width=4,
+                                    font=("Segoe UI", 7), cursor="hand2")
+        self.audit_btn.grid(row=0, column=7, padx=(4, 0))
 
         tk.Label(top2, text="🧱 Стенка = 3+ плотности рядом (отдельно от 🟨 одиночной). "
                              "Пустое «до $» = «от и выше» (без разницы, насколько крупная). "
                              "Двойной клик по строке — редактировать.",
-                 bg="#0a0a0d", fg="#6b7078", font=("Segoe UI", 9)).grid(row=0, column=7, padx=16)
+                 bg="#0a0a0d", fg="#6b7078", font=("Segoe UI", 9)).grid(
+            row=1, column=0, columnspan=9, padx=(0, 4), pady=(6, 0), sticky="w")
 
         mid = tk.Frame(tab_scanner, bg="#0a0a0d")
         mid.pack(fill="x", padx=10, pady=4)
@@ -405,23 +542,72 @@ class App:
                   "live_threshold": 110, "direction": 70, "bid": 100, "ask": 100,
                   "walls": 80, "alerts": 90, "threshold_max": 90, "max_distance_pct": 70,
                   "single_confirm_sec": 70}
-        self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=6)
+        self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=6, selectmode="extended")
         for c in cols:
             self.tree.heading(c, text=headers[c])
             self.tree.column(c, width=widths[c], anchor="center")
         self.tree["displaycolumns"] = ("exchange", "symbol", "mode", "threshold", "threshold_max",
-                                        "max_distance_pct", "single_confirm_sec", "live_threshold", "direction",
-                                        "bid", "ask", "walls", "alerts")
+                                        "max_distance_pct", "single_confirm_sec", "live_threshold",
+                                        "walls", "alerts")
         tree_scroll = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=tree_scroll.set)
         self.tree.pack(side="left", fill="x", expand=True)
         tree_scroll.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", self._edit_selected)
+        self.tree.bind("<Button-3>", lambda e: self._copy_symbol_from_tree_event(self.tree, 1, e))
 
-        walls_frame = tk.Frame(tab_scanner, bg="#0a0a0d")
-        walls_frame.pack(fill="x", padx=10, pady=(8, 4))
-        tk.Label(walls_frame, text="Активные плотности (возраст / дистанция от спреда)",
-                 bg="#0a0a0d", fg="white", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        details_notebook = ttk.Notebook(tab_scanner)
+        details_notebook.pack(fill="x", padx=10, pady=(8, 4))
+
+        prints_frame = tk.Frame(details_notebook, bg="#0a0a0d")
+        walls_frame = tk.Frame(details_notebook, bg="#0a0a0d")
+        details_notebook.add(prints_frame, text="Повторяющиеся принты")
+        details_notebook.add(walls_frame, text="Активные плотности")
+
+        prints_controls = tk.Frame(prints_frame, bg="#0a0a0d")
+        prints_controls.pack(fill="x", pady=(2, 4))
+        tk.Label(prints_controls, text="Мин. принтов: 3", bg="#0a0a0d", fg="#9aa0a6").pack(side="left", padx=(0, 12))
+        tk.Label(prints_controls, text="От $:", bg="#0a0a0d", fg="white").pack(side="left", padx=(0, 4))
+        self.print_min_usd_entry = tk.Entry(prints_controls, width=9)
+        self.print_min_usd_entry.insert(0, f"{self.print_min_usd:g}")
+        self.print_min_usd_entry.pack(side="left", padx=(0, 10))
+        tk.Label(prints_controls, text="До $:", bg="#0a0a0d", fg="white").pack(side="left", padx=(0, 4))
+        self.print_max_usd_entry = tk.Entry(prints_controls, width=9)
+        self.print_max_usd_entry.insert(0, "" if self.print_max_usd is None else f"{self.print_max_usd:g}")
+        self.print_max_usd_entry.pack(side="left", padx=(0, 12))
+        tk.Label(prints_controls, text="Окно, с:", bg="#0a0a0d", fg="white").pack(side="left", padx=(0, 4))
+        self.print_window_entry = tk.Entry(prints_controls, width=8)
+        self.print_window_entry.insert(0, f"{self.print_window_sec:g}")
+        self.print_window_entry.pack(side="left", padx=(0, 12))
+        tk.Label(prints_controls, text="Похожесть, %:", bg="#0a0a0d", fg="white").pack(side="left", padx=(0, 4))
+        self.print_similarity_entry = tk.Entry(prints_controls, width=8)
+        self.print_similarity_entry.insert(0, f"{self.print_similarity_pct:g}")
+        self.print_similarity_entry.pack(side="left", padx=(0, 12))
+        tk.Button(prints_controls, text="Применить", command=self._apply_print_settings,
+                  bg="#1f1f24", fg="white", relief="flat", padx=8).pack(side="left")
+        self.print_min_usd_entry.bind("<Return>", lambda _e: self._apply_print_settings())
+        self.print_max_usd_entry.bind("<Return>", lambda _e: self._apply_print_settings())
+        self.print_window_entry.bind("<Return>", lambda _e: self._apply_print_settings())
+        self.print_similarity_entry.bind("<Return>", lambda _e: self._apply_print_settings())
+
+        pcols = ("time", "exchange", "symbol", "side", "count", "avg", "total", "span", "similarity", "prices", "prints")
+        pheaders = {"time": "Время", "exchange": "Биржа", "symbol": "Символ", "side": "Сторона",
+                    "count": "Принтов", "avg": "Средний $", "total": "Всего $", "span": "Окно",
+                    "similarity": "Похожесть", "prices": "Цены", "prints": "Принты"}
+        pwidths = {"time": 70, "exchange": 120, "symbol": 120, "side": 90, "count": 70,
+                   "avg": 95, "total": 95, "span": 75, "similarity": 85, "prices": 140, "prints": 260}
+        self.prints_tree = ttk.Treeview(prints_frame, columns=pcols, show="headings", height=5)
+        for c in pcols:
+            self.prints_tree.heading(c, text=pheaders[c])
+            self.prints_tree.column(c, width=pwidths[c], anchor="center" if c != "prints" else "w")
+        self.prints_tree.tag_configure("buy", foreground=SIDE_COLOR["bid"])
+        self.prints_tree.tag_configure("sell", foreground=SIDE_COLOR["ask"])
+        prints_scroll = ttk.Scrollbar(prints_frame, orient="vertical", command=self.prints_tree.yview)
+        self.prints_tree.configure(yscrollcommand=prints_scroll.set)
+        self.prints_tree.pack(side="left", fill="x", expand=True)
+        prints_scroll.pack(side="right", fill="y")
+        self.prints_tree.bind("<Double-1>", lambda e: self._copy_symbol_from_tree(self.prints_tree, 2))
+        self.prints_tree.bind("<Button-3>", lambda e: self._copy_symbol_from_tree_event(self.prints_tree, 2, e))
 
         wcols = ("exchange", "symbol", "side", "price", "usd", "age", "dist")
         wheaders = {"exchange": "Биржа", "symbol": "Символ", "side": "Сторона", "price": "Цена",
@@ -437,11 +623,24 @@ class App:
         self.walls_tree.tag_configure("ask", foreground=SIDE_COLOR["ask"])
         self.walls_tree.pack(fill="x")
         self.walls_tree.bind("<Double-1>", lambda e: self._copy_symbol_from_tree(self.walls_tree, 1))
+        self.walls_tree.bind("<Button-3>", lambda e: self._copy_symbol_from_tree_event(self.walls_tree, 1, e))
 
         bottom = tk.Frame(tab_scanner, bg="#0a0a0d")
         bottom.pack(fill="both", expand=True, padx=10, pady=8)
-        tk.Label(bottom, text="Лента алертов", bg="#0a0a0d", fg="white",
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        log_header = tk.Frame(bottom, bg="#0a0a0d")
+        log_header.pack(fill="x")
+        tk.Label(log_header, text="Лента алертов", bg="#0a0a0d", fg="white",
+                 font=("Segoe UI", 11, "bold")).pack(side="left", anchor="w")
+        self.alert_filter_vars = {}
+        for kind, label in ALERT_FILTERS:
+            var = tk.BooleanVar(value=True)
+            self.alert_filter_vars[kind] = var
+            tk.Checkbutton(log_header, text=label, variable=var, command=self._apply_alert_filters,
+                           bg="#0a0a0d", fg="#d1d5db", selectcolor="#131316",
+                           activebackground="#0a0a0d", activeforeground="white",
+                           font=("Segoe UI", 8)).pack(side="left", padx=(8, 0))
+        tk.Button(log_header, text="🧹 Очистить ленту", command=self._clear_alert_log,
+                  bg="#1f1f24", fg="white", relief="flat", padx=8).pack(side="right")
 
         lcols = ("time", "exchange", "symbol", "side", "price", "event", "details", "comment")
         lheaders = {"time": "Время", "exchange": "Биржа", "symbol": "Символ", "side": "Сторона",
@@ -459,6 +658,7 @@ class App:
         self.log.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
         self.log.bind("<Double-1>", self._on_log_double_click)
+        self.log.bind("<Button-3>", lambda e: self._copy_symbol_from_tree_event(self.log, 2, e))
 
         self._build_movers_tab(tab_movers)
         self._build_hedgehog_tab(tab_hedgehog)
@@ -467,6 +667,11 @@ class App:
         status_bar = tk.Label(self.root, textvariable=self.status_var,
                                bg="#000000", fg="#9aa0a6", anchor="w", padx=8)
         status_bar.pack(fill="x", side="bottom")
+
+        self.copy_notice_var = tk.StringVar(value="")
+        self.copy_notice = tk.Label(self.root, textvariable=self.copy_notice_var,
+                                    bg="#111827", fg="#a7f3d0", padx=8, pady=3,
+                                    font=("Segoe UI", 8), relief="flat")
 
         conn_frame = tk.Frame(self.root, bg="#0a0a0d")
         conn_frame.pack(fill="x", side="bottom", padx=10, pady=(1, 1))
@@ -546,6 +751,7 @@ class App:
             tv.pack(side="left", fill="both", expand=True)
             scroll.pack(side="right", fill="y")
             tv.bind("<Double-1>", self._on_mover_double_click)
+            tv.bind("<Button-3>", lambda e, tree=tv: self._copy_symbol_from_tree_event(tree, 1, e))
             frame.pack(side="left", fill="both", expand=True, padx=(0, 6))
             return tv
 
@@ -584,6 +790,7 @@ class App:
         self.hedgehog_tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         self.hedgehog_tree.bind("<Double-1>", lambda e: self._copy_symbol_from_tree(self.hedgehog_tree, 1))
+        self.hedgehog_tree.bind("<Button-3>", lambda e: self._copy_symbol_from_tree_event(self.hedgehog_tree, 1, e))
 
     # ---------------- управление монетами ----------------
 
@@ -600,6 +807,153 @@ class App:
                 self.threshold_max_entry.insert(0, str(hi))
             return
 
+    def _on_exchange_selected(self, _event=None):
+        self._hide_symbol_suggestions()
+        self._show_symbol_suggestions()
+
+    def _seed_symbol_suggestions_from_rows(self):
+        symbols = set()
+        tree = getattr(self, "tree", None)
+        if tree is not None:
+            for key in tree.get_children():
+                vals = tree.item(key, "values")
+                if len(vals) > 1:
+                    symbols.add(self._symbol_from_display(vals[1]))
+        with self._symbol_suggestion_lock:
+            self._symbol_suggestion_set.update(s for s in symbols if s)
+
+    def _add_symbol_to_suggestions(self, symbol):
+        symbol = str(symbol or "").upper()
+        if not symbol:
+            return
+        with self._symbol_suggestion_lock:
+            self._symbol_suggestion_set.add(symbol)
+
+    def _refresh_symbol_suggestions_async(self):
+        if self._symbol_suggestion_refreshing:
+            return
+        self._symbol_suggestion_refreshing = True
+        threading.Thread(target=self._refresh_symbol_suggestions_worker, daemon=True).start()
+
+    def _refresh_symbol_suggestions_worker(self):
+        symbols = set()
+        try:
+            for exchange in EXCHANGE_CHOICES:
+                try:
+                    symbols.update(self._fetch_symbols_for_autocomplete(exchange))
+                except Exception:
+                    continue
+        finally:
+            with self._symbol_suggestion_lock:
+                self._symbol_suggestion_set.update(s for s in symbols if s)
+            self._symbol_suggestion_refreshing = False
+
+    def _fetch_symbols_for_autocomplete(self, exchange):
+        exchange = exchange.upper()
+        if exchange == "BINANCE ALPHA":
+            try:
+                return fetch_alpha_search_symbols() | fetch_rest_symbols(exchange)
+            except Exception:
+                return fetch_rest_symbols(exchange)
+        if exchange in BINANCE_STYLE:
+            import requests
+            cfg = BINANCE_WS_CONFIGS[exchange]
+            resp = requests.get(f"{cfg['rest_base']}{cfg['exchange_info_path']}", timeout=10)
+            resp.raise_for_status()
+            return {
+                str(item.get("symbol", "")).upper()
+                for item in resp.json().get("symbols", [])
+                if str(item.get("symbol", "")).upper().endswith("USDT")
+            }
+        if exchange in REST_POLLING_EXCHANGES:
+            return fetch_rest_symbols(exchange)
+        return set()
+
+    def _on_symbol_keyrelease(self, event=None):
+        keysym = str(getattr(event, "keysym", "") or "")
+        if keysym in {"Up", "Down", "Return", "Escape"}:
+            return
+        self._show_symbol_suggestions()
+
+    def _accept_symbol_entry_or_add(self, _event=None):
+        if self._symbol_suggestions_visible():
+            self._choose_symbol_suggestion()
+            return "break"
+        self._add_symbol()
+        return "break"
+
+    def _focus_symbol_suggestions(self, _event=None):
+        if not self._show_symbol_suggestions():
+            return None
+        if self.symbol_suggest.size() > 0:
+            self.symbol_suggest.focus_set()
+            self.symbol_suggest.selection_clear(0, "end")
+            self.symbol_suggest.selection_set(0)
+            self.symbol_suggest.activate(0)
+            return "break"
+        return None
+
+    def _choose_symbol_suggestion(self, _event=None):
+        if not getattr(self, "symbol_suggest", None):
+            return "break"
+        selection = self.symbol_suggest.curselection()
+        if not selection and self.symbol_suggest.size() > 0:
+            selection = (0,)
+        if selection:
+            symbol = self.symbol_suggest.get(selection[0])
+            self.symbol_entry.delete(0, "end")
+            self.symbol_entry.insert(0, symbol)
+            self.symbol_entry.icursor("end")
+        self._hide_symbol_suggestions()
+        self.symbol_entry.focus_set()
+        return "break"
+
+    def _hide_symbol_suggestions(self):
+        if hasattr(self, "symbol_suggest_popup"):
+            self.symbol_suggest_popup.withdraw()
+
+    def _symbol_suggestions_visible(self):
+        popup = getattr(self, "symbol_suggest_popup", None)
+        return bool(popup is not None and popup.state() != "withdrawn")
+
+    def _show_symbol_suggestions(self):
+        if not hasattr(self, "symbol_suggest"):
+            return False
+        raw = self.symbol_entry.get().strip().upper()
+        exchange = self.exchange_combo.get().upper()
+        normalized = raw.replace("_", "") if exchange == "BINANCE ALPHA" else (
+            _normalize_symbol_input(raw, exchange) if raw else ""
+        )
+        if not raw:
+            self._hide_symbol_suggestions()
+            return False
+        with self._symbol_suggestion_lock:
+            all_symbols = list(self._symbol_suggestion_set)
+        matches = []
+        for symbol in all_symbols:
+            plain = symbol.replace("_", "")
+            if symbol.startswith(raw) or plain.startswith(raw) or symbol.startswith(normalized):
+                matches.append(symbol)
+        matches = sorted(matches)[:20]
+        self.symbol_suggest.delete(0, "end")
+        for symbol in matches:
+            self.symbol_suggest.insert("end", symbol)
+        if matches:
+            visible_rows = min(6, len(matches))
+            self.symbol_suggest.config(height=visible_rows)
+            self.root.update_idletasks()
+            x = self.symbol_entry.winfo_rootx()
+            y = self.symbol_entry.winfo_rooty() + self.symbol_entry.winfo_height()
+            width = max(self.symbol_entry.winfo_width(), 180)
+            row_height = max(18, self.symbol_suggest.winfo_reqheight() // max(visible_rows, 1))
+            height = (row_height * visible_rows) + 4
+            self.symbol_suggest_popup.geometry(f"{width}x{height}+{x}+{y}")
+            self.symbol_suggest_popup.deiconify()
+            self.symbol_suggest_popup.lift()
+            return True
+        self._hide_symbol_suggestions()
+        return False
+
     def _base_exchange_for(self, exchange):
         exchange = (exchange or "").upper()
         if exchange.endswith(" SPOT"):
@@ -612,6 +966,8 @@ class App:
     def _symbol_display(exchange, symbol):
         symbol = (symbol or "").upper()
         exchange = (exchange or "").upper()
+        if exchange == "BINANCE ALPHA":
+            return alpha_display_symbol(symbol)
         return f"{symbol} SPOT" if exchange.endswith(" SPOT") else symbol
 
     @staticmethod
@@ -627,29 +983,27 @@ class App:
         exchange = (exchange or "").upper()
         if exchange == ALL_EXCHANGES_LABEL.upper():
             return EXCHANGE_CHOICES, "всех биржах"
-        base = self._base_exchange_for(exchange)
-        if base in BASE_EXCHANGE_CHOICES:
-            return [base, SPOT_EXCHANGE_BY_BASE[base]], base
         return [exchange], exchange
 
     def _config_targets_for_exchange(self, exchange):
-        """Old configs saved only the base exchange; load them as futures + spot."""
+        """Load saved rows as the exact market that is stored in config.json."""
         exchange = (exchange or "BINANCE").upper()
         if exchange == ALL_EXCHANGES_LABEL.upper():
             return list(EXCHANGE_CHOICES)
-        if exchange in BASE_EXCHANGE_CHOICES:
-            return [exchange, SPOT_EXCHANGE_BY_BASE[exchange]]
         return [exchange]
 
     def _add_symbol(self, symbol=None, threshold=None, direction=None, exchange=None,
                      mode=None, muted=False, silent=False, threshold_max=_UNSET,
                      max_distance_pct=_UNSET, single_confirm_sec=_UNSET,
                      exact_exchange=False):
-        symbol = (symbol or self.symbol_entry.get()).strip().upper()
+        exchange = (exchange or self.exchange_combo.get()).upper()
+        symbol = _normalize_symbol_input(symbol or self.symbol_entry.get(), exchange)
         if not symbol:
             return
         try:
-            threshold = float(threshold if threshold is not None else self.threshold_entry.get())
+            threshold = _parse_compact_usd(threshold if threshold is not None else self.threshold_entry.get())
+            if threshold is None:
+                raise ValueError
         except (ValueError, TypeError):
             if not silent:
                 messagebox.showerror("Ошибка", "Порог должен быть числом")
@@ -661,10 +1015,10 @@ class App:
         # ввода тут не при чём.
         if threshold_max is _UNSET:
             raw_max = self.threshold_max_entry.get().strip() if not silent else ""
-            threshold_max = float(raw_max) if raw_max else None
+            threshold_max = _parse_compact_usd(raw_max) if raw_max else None
         elif threshold_max is not None:
             try:
-                threshold_max = float(threshold_max)
+                threshold_max = _parse_compact_usd(threshold_max)
             except (ValueError, TypeError):
                 threshold_max = None
         if threshold_max is not None and threshold_max <= threshold:
@@ -716,14 +1070,12 @@ class App:
                 messagebox.showerror("Ошибка", "«Жизнь, с» не может быть меньше нуля")
             return
 
-        direction = direction or self.direction_combo.get()
-        exchange = (exchange or self.exchange_combo.get()).upper()
+        direction = "BOTH"
         mode = (mode or self.mode_combo.get()).upper()
         if mode not in ("FIXED", "AUTO"):
             mode = "FIXED"
 
-        if not exact_exchange and (exchange == ALL_EXCHANGES_LABEL.upper()
-                                   or self._base_exchange_for(exchange) in BASE_EXCHANGE_CHOICES):
+        if not exact_exchange and exchange == ALL_EXCHANGES_LABEL.upper():
             exchanges, target_label = self._exchange_targets_for_selection(exchange)
             self._add_symbol_all_exchanges(symbol, threshold, threshold_max, direction, mode,
                                             max_distance_pct, single_confirm_sec,
@@ -744,29 +1096,36 @@ class App:
         if muted:
             self.muted_keys.add(key)
         alerts_display = "🔇 Выкл" if key in self.muted_keys else "🔔 Вкл"
-        threshold_max_display = "-" if threshold_max is None else f"{threshold_max:,.0f}"
+        threshold_max_display = "-" if threshold_max is None else _format_compact_usd(threshold_max).replace("$", "")
         max_distance_display = f"{max_distance_pct:g}"
         single_confirm_display = f"{single_confirm_sec:g}"
+        symbol_display = self._symbol_display(exchange, symbol)
 
         if key not in self.orderbooks:
             self.orderbooks[key] = OrderBook(symbol)
             self.tree.insert("", "end", iid=key,
-                              values=(exchange, symbol, mode, f"{threshold:,.0f}", "-",
+                              values=(exchange, symbol_display, mode, _format_compact_usd(threshold).replace("$", ""), "-",
                                       direction, "-", "-", 0, alerts_display, threshold_max_display,
                                       max_distance_display, single_confirm_display))
+            self._add_symbol_to_suggestions(symbol_display)
             if self.ws_managers:
                 self._ensure_manager(exchange)
                 threading.Thread(target=self._validate_and_subscribe,
                                   args=(exchange, symbol), daemon=True).start()
         else:
-            self.tree.item(key, values=(exchange, symbol, mode, f"{threshold:,.0f}", "-",
+            self.tree.item(key, values=(exchange, symbol_display, mode, _format_compact_usd(threshold).replace("$", ""), "-",
                                          direction, "-", "-", 0, alerts_display, threshold_max_display,
                                          max_distance_display, single_confirm_display))
+            self._add_symbol_to_suggestions(symbol_display)
 
         self._save_config()
         self.symbol_entry.delete(0, "end")
         self.threshold_entry.delete(0, "end")
         self.threshold_max_entry.delete(0, "end")
+        self._hide_symbol_suggestions()
+        symbol = symbol_display
+        if not silent:
+            self.status_var.set(f"{exchange}:{symbol} добавлен в сканер")
         # сбрасываем на дефолт (а не оставляем "липким", как режим/направление) —
         # иначе кастомная дистанция для одной монеты по забывчивости
         # перетекла бы на следующую добавленную по умолчанию
@@ -779,8 +1138,7 @@ class App:
                                    max_distance_pct, single_confirm_sec,
                                    exchanges=None, target_label=None):
         """Проверяет тикер на наборе конкретных рынков в фоне и добавляет
-        только туда, где он реально торгуется. Так обычный выбор BINANCE
-        превращается в BINANCE + BINANCE SPOT без отдельного выбора рынка."""
+        только туда, где он реально торгуется."""
         exchanges = list(exchanges or EXCHANGE_CHOICES)
         target_label = target_label or "всех биржах"
         self.symbol_entry.delete(0, "end")
@@ -835,24 +1193,105 @@ class App:
         self.tree.item(key, values=vals)
         self._save_config()
 
-    def _remove_symbol(self):
-        sel = self.tree.selection()
+    def _remove_symbol(self, _event=None):
+        sel = list(self.tree.selection())
         if not sel:
-            return
-        key = sel[0]
-        exchange, symbol = key.split(":", 1)
-        mgr = self.ws_managers.get(exchange)
-        if mgr:
-            mgr.unsubscribe_symbol(symbol)
-        self.orderbooks.pop(key, None)
-        self.detector.remove_symbol(exchange, symbol)
-        self.muted_keys.discard(key)
-        self.tree.delete(key)
-        for iid in list(self.walls_tree.get_children()):
-            if iid.startswith(f"{key}|"):
-                self.walls_tree.delete(iid)
-                self._wall_row_seq.pop(iid, None)
+            return "break" if _event is not None else None
+
+        removed = []
+        for key in sel:
+            if not self.tree.exists(key):
+                continue
+            exchange, symbol = key.split(":", 1)
+            mgr = self.ws_managers.get(exchange)
+            if mgr:
+                mgr.unsubscribe_symbol(symbol)
+            self.orderbooks.pop(key, None)
+            self.detector.remove_symbol(exchange, symbol)
+            self.muted_keys.discard(key)
+            self.tree.delete(key)
+            for iid in list(self.walls_tree.get_children()):
+                if iid.startswith(f"{key}|"):
+                    self.walls_tree.delete(iid)
+                    self._wall_row_seq.pop(iid, None)
+            removed.append(key)
+
         self._save_config()
+        if removed:
+            self.status_var.set(f"Удалено из сканера: {len(removed)}")
+        return "break" if _event is not None else None
+
+    def _on_global_keypress(self, event=None):
+        if event is None:
+            return None
+        if self._event_matches_hotkey(event, "DELETE"):
+            return self._on_delete_key(event)
+        if self._event_has_ctrl(event) and self._event_matches_hotkey(event, "C"):
+            return self._copy_symbol_hotkey(event)
+        return None
+
+    def _event_has_ctrl(self, event):
+        return bool(getattr(event, "state", 0) & CTRL_MASK)
+
+    def _event_matches_hotkey(self, event, key_name):
+        key_name = key_name.upper()
+        keysym = str(getattr(event, "keysym", "") or "").lower()
+        if keysym in HOTKEY_KEYSYMS.get(key_name, set()):
+            return True
+        try:
+            keycode = int(getattr(event, "keycode", -1))
+        except (TypeError, ValueError):
+            keycode = -1
+        return keycode in HOTKEY_KEYCODES.get(key_name, set())
+
+    def _on_delete_key(self, event=None):
+        focused = self.root.focus_get()
+        if self._is_text_input_focused(focused):
+            return None
+        try:
+            if focused is not None and focused.winfo_class() == "Treeview" and focused is not self.tree:
+                return None
+        except tk.TclError:
+            return None
+        if self.tree.selection():
+            return self._remove_symbol(event)
+        return None
+
+    def _is_text_input_focused(self, widget):
+        if widget is None:
+            return False
+        try:
+            if self._log_comment_editor and widget == self._log_comment_editor.get("entry"):
+                return True
+            return widget.winfo_class() in {"Entry", "TEntry", "Text", "TCombobox", "Spinbox", "TSpinbox"}
+        except tk.TclError:
+            return False
+
+    def _copy_symbol_hotkey(self, _event=None):
+        focused = self.root.focus_get()
+        if self._is_text_input_focused(focused):
+            return None
+        for tree, symbol_index in self._copyable_symbol_trees():
+            if focused == tree:
+                if tree.selection():
+                    self._copy_symbol_from_tree(tree, symbol_index)
+                    return "break"
+                return None
+        return None
+
+    def _copyable_symbol_trees(self):
+        for attr, symbol_index in (
+            ("tree", 1),
+            ("prints_tree", 2),
+            ("walls_tree", 1),
+            ("log", 2),
+            ("gainers_tree", 1),
+            ("losers_tree", 1),
+            ("hedgehog_tree", 1),
+        ):
+            tree = getattr(self, attr, None)
+            if tree is not None:
+                yield tree, symbol_index
 
     def _edit_selected(self, _event):
         sel = self.tree.selection()
@@ -860,18 +1299,17 @@ class App:
             return
         key = sel[0]
         vals = self.tree.item(key, "values")
-        self.exchange_combo.set(self._base_exchange_for(vals[0]))
+        self.exchange_combo.set(vals[0])
         self.symbol_entry.delete(0, "end")
         self.symbol_entry.insert(0, vals[1])
         self.mode_combo.set(vals[2])
         self.threshold_entry.delete(0, "end")
-        self.threshold_entry.insert(0, str(vals[3]).replace(",", ""))
+        self.threshold_entry.insert(0, str(vals[3]).replace("$", ""))
         self.threshold_max_entry.delete(0, "end")
         tmax = vals[10] if len(vals) > 10 else "-"
         if tmax not in ("-", ""):
-            self.threshold_max_entry.insert(0, str(tmax).replace(",", ""))
+            self.threshold_max_entry.insert(0, str(tmax).replace("$", ""))
         self.volume_preset_combo.set("Вручную")
-        self.direction_combo.set(vals[5])
         dist = vals[11] if len(vals) > 11 else str(DEFAULT_MAX_DISTANCE_PCT)
         self.max_distance_entry.delete(0, "end")
         self.max_distance_entry.insert(0, dist or str(DEFAULT_MAX_DISTANCE_PCT))
@@ -887,6 +1325,25 @@ class App:
         self.root.clipboard_clear()
         self.root.clipboard_append(symbol)
         self.status_var.set(f"Скопировано в буфер: {symbol}")
+        self._show_copy_notice(symbol)
+
+    def _show_copy_notice(self, symbol):
+        if not hasattr(self, "copy_notice"):
+            return
+        if self._copy_notice_after_id is not None:
+            try:
+                self.root.after_cancel(self._copy_notice_after_id)
+            except tk.TclError:
+                pass
+        self.copy_notice_var.set(f"Скопировано: {symbol}")
+        self.copy_notice.place(relx=1.0, rely=1.0, x=-18, y=-42, anchor="se")
+        self.copy_notice.lift()
+        self._copy_notice_after_id = self.root.after(1400, self._hide_copy_notice)
+
+    def _hide_copy_notice(self):
+        self._copy_notice_after_id = None
+        if hasattr(self, "copy_notice"):
+            self.copy_notice.place_forget()
 
     def _copy_symbol_from_tree(self, tree, symbol_index=1):
         sel = tree.selection()
@@ -896,6 +1353,50 @@ class App:
         if len(vals) <= symbol_index:
             return
         self._copy_symbol_to_clipboard(self._symbol_from_display(vals[symbol_index]))
+
+    def _copy_symbol_from_tree_event(self, tree, symbol_index=1, event=None):
+        if event is not None:
+            row = tree.identify_row(event.y)
+            if not row:
+                return "break"
+            tree.selection_set(row)
+            tree.focus(row)
+        self._copy_symbol_from_tree(tree, symbol_index)
+        return "break"
+
+    def _clear_alert_log(self):
+        rows = list(self._alert_rows) if self._alert_rows else list(self.log.get_children())
+        if not rows:
+            self.status_var.set("Лента алертов уже пустая")
+            return
+        if not messagebox.askyesno("Очистить ленту", f"Удалить {len(rows)} записей из ленты алертов?"):
+            return
+        self._close_log_comment_editor(save=False)
+        for row in rows:
+            if self.log.exists(row):
+                self.log.delete(row)
+        self._alert_rows.clear()
+        self._alert_row_kinds.clear()
+        self.status_var.set("Лента алертов очищена")
+
+    def _passes_alert_filter(self, kind):
+        var = getattr(self, "alert_filter_vars", {}).get(kind)
+        return True if var is None else bool(var.get())
+
+    def _apply_alert_filters(self):
+        self._close_log_comment_editor(save=True)
+        for row in list(self._alert_rows):
+            if not self.log.exists(row):
+                continue
+            kind = self._alert_row_kinds.get(row)
+            if self._passes_alert_filter(kind):
+                self.log.move(row, "", 0)
+            else:
+                self.log.detach(row)
+        visible = [row for row in reversed(self._alert_rows)
+                   if self.log.exists(row) and self._passes_alert_filter(self._alert_row_kinds.get(row))]
+        for index, row in enumerate(visible):
+            self.log.move(row, "", index)
 
     def _on_log_double_click(self, event):
         self._close_log_comment_editor(save=True)
@@ -970,11 +1471,14 @@ class App:
         if exchange in self.ws_managers:
             return
         if exchange in BINANCE_STYLE:
-            mgr = ExchangeWSManager(exchange, self._on_depth_update, self._on_status)
+            mgr = ExchangeWSManager(exchange, self._on_depth_update, self._on_status,
+                                    on_trade_update=self._on_trade_update)
         elif exchange.startswith("GATE"):
             mgr = GateWSManager(self._on_depth_update, self._on_status, exchange=exchange)
         elif exchange.startswith("OKX"):
             mgr = OKXWSManager(self._on_depth_update, self._on_status, exchange=exchange)
+        elif exchange in REST_POLLING_EXCHANGES:
+            mgr = RestPollingManager(exchange, self._on_depth_update, self._on_status)
         else:
             return
         self._update_conn_label(exchange, "connecting")
@@ -988,6 +1492,8 @@ class App:
             return lambda s: gate_validate_symbol(s, exchange=exchange)
         if exchange.startswith("OKX"):
             return lambda s: okx_validate_symbol(s, exchange=exchange)
+        if exchange in REST_POLLING_EXCHANGES:
+            return lambda s: validate_rest_symbol(exchange, s)
         return lambda s: True
 
     def _validate_and_subscribe(self, exchange, symbol):
@@ -1110,7 +1616,13 @@ class App:
         if not ob.synced:
             return
 
-        for ev in self.detector.scan(exchange, symbol, ob):
+        events = self.detector.scan(exchange, symbol, ob)
+        for ev in events:
+            self._annotate_event_with_trades(ev)
+        if self.audit_writer.is_open:
+            self._write_audit_for_depth(exchange, symbol, ob, events)
+
+        for ev in events:
             self.event_queue.put(("EVENT", ev))
 
         live_threshold = self.detector.last_threshold.get(key)
@@ -1124,6 +1636,34 @@ class App:
 
     def _on_status(self, text):
         self.event_queue.put(("STATUS", text))
+
+    def _on_trade_update(self, exchange, symbol, event):
+        if exchange not in TRADE_TAPE_EXCHANGES:
+            return
+        try:
+            trade = self.trade_tape.add_binance_trade(exchange, event)
+            if trade and self.audit_writer.is_open:
+                self.audit_writer.write_trade(trade)
+            cluster = self.trade_tape.find_repeating_print_cluster(
+                trade,
+                min_count=REPEATING_PRINT_MIN_COUNT,
+                window_sec=self.print_window_sec,
+                similarity_pct=self.print_similarity_pct,
+                min_usd=self.print_min_usd,
+                max_usd=self.print_max_usd,
+            )
+            if cluster:
+                self.event_queue.put(("PRINT_CLUSTER", cluster))
+        except Exception as e:
+            dlog(f"trade tape update error for {exchange}:{symbol}: {e!r}")
+
+    def _annotate_event_with_trades(self, ev):
+        if ev.exchange not in TRADE_TAPE_EXCHANGES:
+            return
+        try:
+            self.trade_tape.annotate_wall_event(ev)
+        except Exception as e:
+            dlog(f"trade event annotation error for {ev.exchange}:{ev.symbol}: {e!r}")
 
     def _on_market_update(self, tickers):
         # вызывается из фонового потока MarketScanner — как и остальные
@@ -1175,6 +1715,9 @@ class App:
                 kind = item[0]
                 if kind == "EVENT":
                     self._render_event(item[1])
+                elif kind == "AUDIT_ERROR":
+                    self._set_audit_ui(False)
+                    self.status_var.set(item[1])
                 elif kind == "STATUS":
                     self.status_var.set(item[1])
                     self._handle_status_for_conn(item[1])
@@ -1182,7 +1725,7 @@ class App:
                     _, key, bid, ask, walls, live_threshold = item
                     if self.tree.exists(key):
                         vals = list(self.tree.item(key, "values"))
-                        vals[4] = f"{live_threshold:,.0f}" if live_threshold is not None else "прогрев..."
+                        vals[4] = _format_compact_usd(live_threshold).replace("$", "") if live_threshold is not None else "прогрев..."
                         vals[6] = f"{bid:.6f}" if bid else "-"
                         vals[7] = f"{ask:.6f}" if ask else "-"
                         vals[8] = walls
@@ -1190,6 +1733,8 @@ class App:
                 elif kind == "WALLS":
                     _, exchange, symbol, snapshot = item
                     self._update_walls_tree(exchange, symbol, snapshot)
+                elif kind == "PRINT_CLUSTER":
+                    self._render_print_cluster(item[1])
                 elif kind == "MARKET":
                     self._update_movers_trees(item[1])
                 elif kind == "HEDGEHOG":
@@ -1207,14 +1752,97 @@ class App:
         side_ru = self._side_display(ev.side)
         price_str = f"{ev.price:g}" if ev.price else "-"
         symbol_display = self._symbol_display(ev.exchange, ev.symbol)
-        self.log.insert("", 0, values=(ts, ev.exchange, symbol_display, side_ru, price_str,
-                                        EVENT_LABELS[ev.kind], ev.extra, ""), tags=(ev.kind,))
-        children = self.log.get_children()
-        if len(children) > 500:
-            self.log.delete(children[-1])
+        iid = f"alert-{self._next_alert_seq}"
+        self._next_alert_seq += 1
+        self.log.insert("", 0, iid=iid, values=(ts, ev.exchange, symbol_display, side_ru, price_str,
+                                                EVENT_LABELS[ev.kind], ev.extra, ""), tags=(ev.kind,))
+        self._alert_rows.append(iid)
+        self._alert_row_kinds[iid] = ev.kind
+        if not self._passes_alert_filter(ev.kind):
+            self.log.detach(iid)
+        while len(self._alert_rows) > 500:
+            old = self._alert_rows.pop(0)
+            self._alert_row_kinds.pop(old, None)
+            if self.log.exists(old):
+                self.log.delete(old)
 
         if self.sound_enabled.get():
             threading.Thread(target=_play_beep, args=(ev.kind,), daemon=True).start()
+
+    def _render_print_cluster(self, cluster):
+        if not hasattr(self, "prints_tree"):
+            return
+        side = cluster.get("side", "")
+        side_ru = "покупки" if side == "buy" else "продажи"
+        ts = datetime.fromtimestamp(cluster["last_ts"]).strftime("%H:%M:%S")
+        symbol_display = self._symbol_display(cluster["exchange"], cluster["symbol"])
+        prices = (f"{cluster['min_price']:g}" if cluster["min_price"] == cluster["max_price"]
+                  else f"{cluster['min_price']:g}-{cluster['max_price']:g}")
+        span = "подряд" if cluster.get("window_sec", 0) == 0 else f"{cluster['span_sec']:.1f}с"
+        print_values = " / ".join(_format_compact_usd(v) for v in cluster.get("print_usd", [])[-6:])
+        if len(cluster.get("print_usd", [])) > 6:
+            print_values = f"... / {print_values}"
+        values = (
+            ts,
+            cluster["exchange"],
+            symbol_display,
+            side_ru,
+            cluster["count"],
+            _format_compact_usd(cluster["avg_usd"]),
+            _format_compact_usd(cluster["total_usd"]),
+            span,
+            f"±{cluster['similarity_pct']:g}%",
+            prices,
+            print_values,
+        )
+        iid = cluster["series_id"]
+        if self.prints_tree.exists(iid):
+            self.prints_tree.item(iid, values=values, tags=(side,))
+            self.prints_tree.move(iid, "", 0)
+        else:
+            self.prints_tree.insert("", 0, iid=iid, values=values, tags=(side,))
+        children = self.prints_tree.get_children()
+        if len(children) > MAX_PRINT_ROWS:
+            self.prints_tree.delete(*children[MAX_PRINT_ROWS:])
+
+    def _set_audit_ui(self, active):
+        self.audit_enabled.set(active)
+        if hasattr(self, "audit_btn"):
+            self.audit_btn.config(
+                text="csv",
+                bg="#231316" if active else "#0a0a0d",
+                fg="#dc6b75" if active else "#343842",
+                activebackground="#231316" if active else "#0a0a0d",
+                activeforeground="#fca5a5" if active else "#737883",
+            )
+
+    def _toggle_audit(self):
+        if self.audit_writer.is_open:
+            path = self.audit_writer.path
+            self.audit_writer.stop()
+            self._set_audit_ui(False)
+            self.status_var.set(f"Аудит CSV остановлен: {path}")
+            return
+        try:
+            path = self.audit_writer.start()
+            self._set_audit_ui(True)
+            self.status_var.set(f"Аудит CSV пишет файл: {path}")
+        except Exception as e:
+            self._set_audit_ui(False)
+            messagebox.showerror("Аудит CSV", f"Не удалось начать запись:\n{e}")
+
+    def _write_audit_for_depth(self, exchange, symbol, orderbook, events):
+        try:
+            for ev in events:
+                self.audit_writer.write_event(ev)
+            snapshot = self.detector.snapshot(exchange, symbol, orderbook)
+            self.audit_writer.write_snapshot(exchange, symbol, snapshot)
+        except Exception as e:
+            dlog(f"audit csv write error: {e!r}")
+            try:
+                self.audit_writer.stop()
+            finally:
+                self.event_queue.put(("AUDIT_ERROR", f"Аудит CSV остановлен из-за ошибки записи: {e}"))
 
     def _update_walls_tree(self, exchange, symbol, snapshot):
         key = f"{exchange}:{symbol}"
@@ -1232,7 +1860,7 @@ class App:
             side_ru = self._side_display(w["side"])
             if w.get("near_spread"):
                 side_ru = f"{side_ru}/у спреда"
-            values = (exchange, symbol, side_ru, f"{w['price']:g}", f"${w['usd']:,.0f}",
+            values = (exchange, symbol, side_ru, f"{w['price']:g}", _format_compact_usd(w["usd"]),
                       format_age(w["age"]), f"{w['dist_pct']:.2f}%")
             if self.walls_tree.exists(iid):
                 self.walls_tree.item(iid, values=values, tags=(w["side"],))
@@ -1272,7 +1900,7 @@ class App:
             tree.insert("", "end", iid=key, values=(
                 r["exchange"], r["symbol"], f"{r['last']:g}",
                 f"{r['change_pct_24h']:+.2f}%", impulse_str,
-                f"${r['quote_volume']:,.0f}",
+                _format_compact_usd(r["quote_volume"]),
             ), tags=(tag,))
 
     # ---------------- настройка/алерты импульса ----------------
@@ -1336,6 +1964,82 @@ class App:
         }
         try:
             with open(IMPULSE_SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _apply_print_settings(self):
+        try:
+            min_raw = self.print_min_usd_entry.get().strip()
+            max_raw = self.print_max_usd_entry.get().strip()
+            min_usd = _parse_decimal(min_raw) if min_raw else 0.0
+            max_usd = _parse_decimal(max_raw) if max_raw else None
+            window_sec = _parse_decimal(self.print_window_entry.get())
+            similarity_pct = _parse_decimal(self.print_similarity_entry.get())
+        except ValueError:
+            messagebox.showerror("Повторяющиеся принты", "Объём, окно и похожесть должны быть числами")
+            return
+        if min_usd < 0:
+            messagebox.showerror("Повторяющиеся принты", "«От $» не может быть меньше 0")
+            return
+        if max_usd is not None and max_usd <= min_usd:
+            messagebox.showerror("Повторяющиеся принты", "«До $» должно быть больше «От $»")
+            return
+        if window_sec < 0:
+            messagebox.showerror("Повторяющиеся принты", "Окно не может быть меньше 0 секунд")
+            return
+        if similarity_pct < 0:
+            messagebox.showerror("Повторяющиеся принты", "Похожесть не может быть меньше 0%")
+            return
+        self.print_min_usd = min_usd
+        self.print_max_usd = max_usd
+        self.print_window_sec = window_sec
+        self.print_similarity_pct = similarity_pct
+        self.print_min_usd_entry.delete(0, "end")
+        self.print_min_usd_entry.insert(0, f"{self.print_min_usd:g}")
+        self.print_max_usd_entry.delete(0, "end")
+        self.print_max_usd_entry.insert(0, "" if self.print_max_usd is None else f"{self.print_max_usd:g}")
+        self.print_window_entry.delete(0, "end")
+        self.print_window_entry.insert(0, f"{self.print_window_sec:g}")
+        self.print_similarity_entry.delete(0, "end")
+        self.print_similarity_entry.insert(0, f"{self.print_similarity_pct:g}")
+        self._save_print_settings()
+        volume_text = f"от {_format_compact_usd(min_usd)}" + (
+            f" до {_format_compact_usd(max_usd)}" if max_usd is not None else " и выше"
+        )
+        self.status_var.set(
+            f"Повторяющиеся принты: {volume_text}, минимум {REPEATING_PRINT_MIN_COUNT}, "
+            f"окно {window_sec:g}с, похожесть ±{similarity_pct:g}%"
+        )
+
+    def _load_print_settings(self):
+        if not os.path.exists(PRINT_SETTINGS_FILE):
+            return
+        try:
+            with open(PRINT_SETTINGS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            self.print_min_usd = max(0.0, float(data.get("min_usd", self.print_min_usd)))
+            raw_max_usd = data.get("max_usd", self.print_max_usd)
+            if raw_max_usd is None:
+                self.print_max_usd = None
+            else:
+                raw_max_usd = float(raw_max_usd)
+                self.print_max_usd = raw_max_usd if raw_max_usd > self.print_min_usd else None
+            self.print_window_sec = max(0.0, float(data.get("window_sec", self.print_window_sec)))
+            self.print_similarity_pct = max(0.0, float(data.get("similarity_pct", self.print_similarity_pct)))
+        except Exception:
+            pass
+
+    def _save_print_settings(self):
+        data = {
+            "min_usd": self.print_min_usd,
+            "max_usd": self.print_max_usd,
+            "window_sec": self.print_window_sec,
+            "similarity_pct": self.print_similarity_pct,
+            "min_count": REPEATING_PRINT_MIN_COUNT,
+        }
+        try:
+            with open(PRINT_SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
@@ -1456,7 +2160,7 @@ class App:
                 c["exchange"], c["symbol"], f"{c['last']:g}",
                 f"{c['hh_range_pct']:.2f}%",
                 f"{c['hh_touch_top']:.2f}", f"{c['hh_touch_bot']:.2f}",
-                f"${c['vol_60m']:,.0f}", f"${c['vol_10m']:,.0f}",
+                _format_compact_usd(c["vol_60m"]), _format_compact_usd(c["vol_10m"]),
             ))
 
     # ---------------- сохранение конфига ----------------
@@ -1472,7 +2176,7 @@ class App:
             threshold_max = None
             if tmax_raw not in ("-", ""):
                 try:
-                    threshold_max = float(str(tmax_raw).replace(",", ""))
+                    threshold_max = _parse_compact_usd(tmax_raw)
                 except ValueError:
                     threshold_max = None
             dist_raw = vals[11] if len(vals) > 11 else DEFAULT_MAX_DISTANCE_PCT
@@ -1489,9 +2193,9 @@ class App:
                 "exchange": vals[0],
                 "symbol": vals[1],
                 "mode": vals[2],
-                "threshold": float(str(vals[3]).replace(",", "")),
+                "threshold": float(_parse_compact_usd(vals[3]) or 0.0),
                 "threshold_max": threshold_max,
-                "direction": vals[5],
+                "direction": "BOTH",
                 "muted": key in self.muted_keys,
                 "max_distance_pct": max_distance_pct,
                 "single_confirm_sec": single_confirm_sec,
@@ -1576,10 +2280,12 @@ class App:
             messagebox.showerror("Ошибка импорта", f"Не удалось прочитать файл:\n{e}")
 
     def _on_close(self):
+        self.audit_writer.stop()
         for mgr in self.ws_managers.values():
             mgr.stop()
         self.market_scanner.stop()
         self.hedgehog_scanner.stop()
         self._save_config()
         self._save_impulse_settings()
+        self._save_print_settings()
         self.root.destroy()

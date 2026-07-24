@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from detector import WallDetector, SymbolConfig, NEAR_SPREAD_PCT
+from detector import WallDetector, SymbolConfig, NEAR_SPREAD_PCT, format_age
 from orderbook import OrderBook
 
 
@@ -17,6 +17,11 @@ def make_ob(bids, asks=None):
 
 def prime(det):
     det.scan("BINANCE", "TESTUSDT", make_ob({0.5: 0.0001}, {1.5: 1.0}))
+
+
+assert format_age(10.9) == "10.9с", "age below a minute should keep tenths, not show a rounded 0:10"
+assert format_age(61.2) == "1:01", "age above a minute can stay compact mm:ss"
+print("OK: wall lifetime display keeps tenths below one minute")
 
 
 # 0% now means distance from the spread edge: best bid for bid walls, best ask for ask walls.
@@ -65,7 +70,12 @@ det_now.set_config(SymbolConfig(
 ))
 prime(det_now)
 events_now = det_now.scan("BINANCE", "TESTUSDT", make_ob({1.00: 100_000}, {1.02: 1.0}))
-assert len([e for e in events_now if e.kind == "APPEARED"]) == 1
+appeared_now = [e for e in events_now if e.kind == "APPEARED"]
+assert len(appeared_now) == 1
+assert appeared_now[0].usd == 100_000
+assert appeared_now[0].best_bid == 1.00
+assert appeared_now[0].best_ask == 1.02
+assert appeared_now[0].dist_pct == 0.0
 print("OK: 0 seconds lifetime confirms a new wall immediately")
 
 

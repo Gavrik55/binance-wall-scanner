@@ -84,11 +84,27 @@ def size_label(usd: float) -> str:
 
 def format_age(seconds: float) -> str:
     seconds = max(0.0, float(seconds))
-    if seconds < 1.0:
+    if seconds < 60.0:
         return f"{seconds:.1f}с"
     seconds = int(seconds)
     m, s = divmod(seconds, 60)
     return f"{m}:{s:02d}"
+
+
+def format_usd_compact(value: float) -> str:
+    value = float(value or 0.0)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+
+    def trim(num):
+        text = f"{num:.1f}"
+        return text[:-2] if text.endswith(".0") else text
+
+    if value >= 1_000_000:
+        return f"{sign}${trim(value / 1_000_000)}м"
+    if value >= 1_000:
+        return f"{sign}${trim(value / 1_000)}к"
+    return f"{sign}${value:.0f}"
 
 
 class WallState:
@@ -113,7 +129,7 @@ class WallState:
 
 
 class WallEvent:
-    def __init__(self, exchange, symbol, kind, price, qty, side, extra=""):
+    def __init__(self, exchange, symbol, kind, price, qty, side, extra="", **context):
         self.exchange = exchange
         self.symbol = symbol
         self.kind = kind  # APPEARED / MAGNET / EATEN / PULLED / WALL / WALL_GONE
@@ -122,6 +138,8 @@ class WallEvent:
         self.side = side
         self.extra = extra
         self.ts = time.time()
+        for name, value in context.items():
+            setattr(self, name, value)
 
 
 class SymbolConfig:
@@ -325,6 +343,7 @@ class WallDetector:
         sides = self._sides_to_scan(cfg.direction)
         book_side = {"bid": orderbook.bids, "ask": orderbook.asks}
         best = {"bid": orderbook.best_bid(), "ask": orderbook.best_ask()}
+        spread = (best["ask"] - best["bid"]) if best["bid"] is not None and best["ask"] is not None else None
 
         def within_range(side, price):
             return self._distance_from_spread_pct(side, price, best["bid"], best["ask"], mid) <= cfg.max_distance_pct
@@ -342,6 +361,35 @@ class WallDetector:
         self.last_threshold[key] = threshold
         if threshold is None:
             return events  # прогревается
+
+        def make_event(kind, price, qty, side, extra="", state=None, usd=None):
+            edge = best["bid"] if side == "bid" else best["ask"]
+            dist_abs = abs(edge - price) if edge is not None and price else None
+            dist_pct = self._distance_from_spread_pct(side, price, best["bid"], best["ask"], mid) if price else None
+            event_usd = usd if usd is not None else (price * qty if price and qty else 0.0)
+            return WallEvent(
+                exchange, symbol, kind, price, qty, side, extra,
+                usd=event_usd,
+                best_bid=best["bid"],
+                best_ask=best["ask"],
+                mid=mid,
+                spread=spread,
+                dist_abs=dist_abs,
+                dist_pct=dist_pct,
+                age_sec=(now - state.first_seen) if state is not None else None,
+                first_seen_ts=state.first_seen if state is not None else None,
+                initial_qty=getattr(state, "initial_qty", None),
+                max_qty=getattr(state, "max_qty", None),
+                max_usd=(price * state.max_qty) if state is not None and price else None,
+                threshold_usd=threshold,
+                threshold_max_usd=cfg.threshold_max_usd,
+                max_distance_pct=cfg.max_distance_pct,
+                single_confirm_sec=cfg.single_confirm_sec,
+                confirmed=getattr(state, "confirmed", None),
+                baseline=getattr(state, "is_baseline", None),
+                near_spread=(dist_pct is not None and dist_pct <= NEAR_SPREAD_PCT),
+                ts=now,
+            )
 
         # is_baseline_tick: самый первый реальный скан этого символа (после
         # запуска приложения / добавления символа / прогрева AUTO-порога).
@@ -400,11 +448,11 @@ class WallDetector:
                     if len(rounded_usd) != 1:
                         continue  # объёмы не совпадают — это не каскад
                     usd_each = usd_by_price[group_prices[0]]
-                    events.append(WallEvent(
-                        exchange, symbol, "CASCADE",
-                        (group_prices[0] + group_prices[-1]) / 2, 0, side,
-                        extra=f"{len(group_prices)} плотности по ${usd_each:,.0f}, "
-                              f"цены {group_prices[0]:g}–{group_prices[-1]:g}"
+                    events.append(make_event(
+                        "CASCADE", (group_prices[0] + group_prices[-1]) / 2, 0, side,
+                        extra=f"{len(group_prices)} плотности по {format_usd_compact(usd_each)}, "
+                              f"цены {group_prices[0]:g}–{group_prices[-1]:g}",
+                        usd=usd_each * len(group_prices),
                     ))
 
         # 2) магнит / подтверждение одиночной плотности (APPEARED) / съедено / снято
@@ -446,9 +494,11 @@ class WallDetector:
             if not w.push_fired and dist_pct_now <= NEAR_SPREAD_PCT:
                 w.push_fired = True
                 usd_now = price * cur_qty
-                events.append(WallEvent(
-                    exchange, symbol, "PUSH", price, cur_qty, w.side,
-                    extra=f"${usd_now:,.0f} у спреда, дистанция {dist_pct_now:.3f}%, стоит {format_age(age)}"
+                events.append(make_event(
+                    "PUSH", price, cur_qty, w.side,
+                    extra=f"{format_usd_compact(usd_now)} у спреда, дистанция {dist_pct_now:.3f}%, стоит {format_age(age)}",
+                    state=w,
+                    usd=usd_now,
                 ))
 
             if w.confirmed:
@@ -468,9 +518,11 @@ class WallDetector:
                     kind = "EATEN" if touched else "PULLED"
                     max_usd = w.max_qty * price
                     pct_left = (usd_now / max_usd * 100) if max_usd else 0
-                    events.append(WallEvent(
-                        exchange, symbol, kind, price, cur_qty, w.side,
-                        extra=f"было ${max_usd:,.0f}, осталось {pct_left:.0f}%, жила {format_age(age)}"
+                    events.append(make_event(
+                        kind, price, cur_qty, w.side,
+                        extra=f"было {format_usd_compact(max_usd)}, осталось {pct_left:.0f}%, жила {format_age(age)}",
+                        state=w,
+                        usd=usd_now,
                     ))
                     del walls[price]
                     continue
@@ -485,10 +537,12 @@ class WallDetector:
                     max_usd = price * w.max_qty
                     eaten_usd = max(0.0, max_usd - usd_now)
                     eaten_pct = (eaten_usd / max_usd * 100) if max_usd else 0
-                    events.append(WallEvent(
-                        exchange, symbol, "MAGNET", price, cur_qty, w.side,
-                        extra=f"${usd_now:,.0f} осталось (съедено ${eaten_usd:,.0f}, {eaten_pct:.0f}%), "
-                              f"цена дошла через {age:.1f}с после появления"
+                    events.append(make_event(
+                        "MAGNET", price, cur_qty, w.side,
+                        extra=f"{format_usd_compact(usd_now)} осталось (съедено {format_usd_compact(eaten_usd)}, {eaten_pct:.0f}%), "
+                              f"цена дошла через {age:.1f}с после появления",
+                        state=w,
+                        usd=usd_now,
                     ))
                 elif age > cfg.magnet_window_max_sec:
                     w.magnet_fired = True  # окно закрылось без притяжения
@@ -503,9 +557,12 @@ class WallDetector:
                 if age >= cfg.single_confirm_sec:
                     w.confirmed = True
                     usd = price * cur_qty
-                    events.append(WallEvent(
-                        exchange, symbol, "APPEARED", price, cur_qty, w.side,
-                        extra=f"${usd:,.0f} {size_label(usd)}, стоит {format_age(age)}"
+                    events.append(make_event(
+                        "APPEARED", price, cur_qty, w.side,
+                        extra=(f"{format_usd_compact(usd)} {size_label(usd)}, стоит {format_age(age)} "
+                               f"(фильтр >= {format_age(cfg.single_confirm_sec)})"),
+                        state=w,
+                        usd=usd,
                     ))
                 continue
 
@@ -587,9 +644,10 @@ class WallDetector:
             if matched is not None:
                 cl["baseline"] = matched["baseline"]  # наследуем статус, пока кластер жив
             if not cl["baseline"] and matched is None:
-                events.append(WallEvent(
-                    exchange, symbol, "WALL", (cl["min"] + cl["max"]) / 2, 0, cl["side"],
-                    extra=f"{cl['count']} плотности, ${cl['usd']:,.0f}, диапазон {cl['min']:g}–{cl['max']:g}"
+                events.append(make_event(
+                    "WALL", (cl["min"] + cl["max"]) / 2, 0, cl["side"],
+                    extra=f"{cl['count']} плотности, {format_usd_compact(cl['usd'])}, диапазон {cl['min']:g}–{cl['max']:g}",
+                    usd=cl["usd"],
                 ))
             new_known.append(cl)
 
@@ -597,9 +655,9 @@ class WallDetector:
             if k["baseline"]:
                 continue  # о появлении не объявляли — и о распаде не объявляем
             if not any(overlaps(k, cl) for cl in current_clusters):
-                events.append(WallEvent(
-                    exchange, symbol, "WALL_GONE", (k["min"] + k["max"]) / 2, 0, k["side"],
-                    extra=f"стенка из {k['count']} плотностей распалась"
+                events.append(make_event(
+                    "WALL_GONE", (k["min"] + k["max"]) / 2, 0, k["side"],
+                    extra=f"стенка из {k['count']} плотностей распалась",
                 ))
 
         self.known_clusters[key] = new_known
@@ -609,9 +667,11 @@ class WallDetector:
     def snapshot(self, exchange, symbol, orderbook):
         """Текущее состояние активных плотностей для UI: возраст и дистанция от цены."""
         key = self._key(exchange, symbol)
+        cfg = self.configs.get(key)
         mid = orderbook.mid()
         best_bid = orderbook.best_bid()
         best_ask = orderbook.best_ask()
+        spread = (best_ask - best_bid) if best_bid is not None and best_ask is not None else None
         now = time.time()
         result = []
         for price, w in self.active_walls.get(key, {}).items():
@@ -621,10 +681,21 @@ class WallDetector:
             result.append({
                 "price": price,
                 "side": w.side,
+                "qty": w.current_qty,
                 "usd": price * w.current_qty,
                 "age": now - w.first_seen,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "mid": mid,
+                "spread": spread,
                 "dist_abs": dist_abs,
                 "dist_pct": dist_pct,
                 "near_spread": dist_pct <= NEAR_SPREAD_PCT,
+                "threshold_usd": self.last_threshold.get(key),
+                "threshold_max_usd": cfg.threshold_max_usd if cfg else None,
+                "max_distance_pct": cfg.max_distance_pct if cfg else None,
+                "single_confirm_sec": cfg.single_confirm_sec if cfg else None,
+                "confirmed": w.confirmed,
+                "baseline": w.is_baseline,
             })
         return result

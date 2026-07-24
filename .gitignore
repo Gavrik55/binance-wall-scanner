@@ -17,6 +17,7 @@ ENV/
 # PyInstaller build output
 build/
 dist/
+dist-versioned/
 
 # Packaged binaries and runtime files
 *.exe
@@ -26,6 +27,7 @@ config.json
 impulse_settings.json
 screen-check-*.png
 debug_packs/
+audit_logs/
 .build_config_backup/
 
 # Local editor and OS files

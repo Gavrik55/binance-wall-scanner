@@ -48,8 +48,10 @@ mkdir "%BACKUP_DIR%"
 
 if exist "dist\BinanceWallScanner\config.json" copy /Y "dist\BinanceWallScanner\config.json" "%BACKUP_DIR%\config.json" >nul
 if exist "dist\BinanceWallScanner\impulse_settings.json" copy /Y "dist\BinanceWallScanner\impulse_settings.json" "%BACKUP_DIR%\impulse_settings.json" >nul
+if exist "dist\BinanceWallScanner\print_settings.json" copy /Y "dist\BinanceWallScanner\print_settings.json" "%BACKUP_DIR%\print_settings.json" >nul
 if exist "dist\config.json" copy /Y "dist\config.json" "%BACKUP_DIR%\dist-config.json" >nul
 if exist "dist\impulse_settings.json" copy /Y "dist\impulse_settings.json" "%BACKUP_DIR%\dist-impulse_settings.json" >nul
+if exist "dist\print_settings.json" copy /Y "dist\print_settings.json" "%BACKUP_DIR%\dist-print_settings.json" >nul
 
 if defined SKIP_PIP (
     echo.
@@ -78,8 +80,10 @@ if %errorlevel% neq 0 goto build_error
 
 if exist "%BACKUP_DIR%\config.json" copy /Y "%BACKUP_DIR%\config.json" "dist\BinanceWallScanner\config.json" >nul
 if exist "%BACKUP_DIR%\impulse_settings.json" copy /Y "%BACKUP_DIR%\impulse_settings.json" "dist\BinanceWallScanner\impulse_settings.json" >nul
+if exist "%BACKUP_DIR%\print_settings.json" copy /Y "%BACKUP_DIR%\print_settings.json" "dist\BinanceWallScanner\print_settings.json" >nul
 if exist "%BACKUP_DIR%\dist-config.json" copy /Y "%BACKUP_DIR%\dist-config.json" "dist\config.json" >nul
 if exist "%BACKUP_DIR%\dist-impulse_settings.json" copy /Y "%BACKUP_DIR%\dist-impulse_settings.json" "dist\impulse_settings.json" >nul
+if exist "%BACKUP_DIR%\dist-print_settings.json" copy /Y "%BACKUP_DIR%\dist-print_settings.json" "dist\print_settings.json" >nul
 
 if exist "%BACKUP_DIR%" rmdir /S /Q "%BACKUP_DIR%"
 

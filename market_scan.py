@@ -14,6 +14,8 @@ REST-эндпоинт, отдающий тикеры сразу по всему 
   GATE SPOT:        GET /api/v4/spot/tickers
   OKX:              GET /api/v5/market/tickers?instType=SWAP
   OKX SPOT:         GET /api/v5/market/tickers?instType=SPOT
+  MEXC:             GET /api/v1/contract/ticker
+  MEXC SPOT:        GET /api/v3/ticker/24hr
   BYBIT:            GET /v5/market/tickers?category=linear
 
 Поэтому rate-лимиты тут не проблема (по одному запросу на биржу раз в
@@ -57,6 +59,8 @@ REST_URLS = {
     "GATE": "https://fx-api.gateio.ws/api/v4/futures/usdt/tickers",
     "GATE SPOT": "https://api.gateio.ws/api/v4/spot/tickers",
     "OKX": "https://www.okx.com/api/v5/market/tickers",
+    "MEXC": "https://contract.mexc.com/api/v1/contract/ticker",
+    "MEXC SPOT": "https://api.mexc.com/api/v3/ticker/24hr",
     "BYBIT": "https://api.bybit.com/v5/market/tickers",
 }
 
@@ -153,6 +157,52 @@ def _fetch_okx(inst_type="SWAP", exchange="OKX") -> list:
     return out
 
 
+def _fetch_mexc() -> list:
+    resp = requests.get(REST_URLS["MEXC"], timeout=10)
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    if isinstance(data, dict):
+        data = [data]
+    out = []
+    for item in data:
+        symbol = str(item.get("symbol", "")).replace("_", "").upper()
+        if not symbol.endswith("USDT"):
+            continue
+        try:
+            last = float(item["lastPrice"])
+            out.append({
+                "exchange": "MEXC",
+                "symbol": symbol,
+                "last": last,
+                "change_pct_24h": float(item.get("riseFallRate", 0.0)) * 100,
+                "quote_volume": float(item.get("amount24", 0.0)),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out
+
+
+def _fetch_mexc_spot() -> list:
+    resp = requests.get(REST_URLS["MEXC SPOT"], timeout=10)
+    resp.raise_for_status()
+    out = []
+    for item in resp.json():
+        symbol = str(item.get("symbol", "")).upper()
+        if not symbol.endswith("USDT"):
+            continue
+        try:
+            out.append({
+                "exchange": "MEXC SPOT",
+                "symbol": symbol,
+                "last": float(item["lastPrice"]),
+                "change_pct_24h": float(item.get("priceChangePercent", 0.0)),
+                "quote_volume": float(item.get("quoteVolume", 0.0)),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out
+
+
 def _fetch_bybit() -> list:
     resp = requests.get(REST_URLS["BYBIT"], params={"category": "linear"}, timeout=10)
     resp.raise_for_status()
@@ -186,6 +236,8 @@ FETCHERS = {
     "GATE SPOT": _fetch_gate_spot,
     "OKX": lambda: _fetch_okx("SWAP", "OKX"),
     "OKX SPOT": lambda: _fetch_okx("SPOT", "OKX SPOT"),
+    "MEXC": _fetch_mexc,
+    "MEXC SPOT": _fetch_mexc_spot,
     "BYBIT": _fetch_bybit,
 }
 

@@ -27,6 +27,7 @@ EXCHANGES = {
         "rest_base": "https://fapi.binance.com",
         "depth_path": "/fapi/v1/depth",
         "exchange_info_path": "/fapi/v1/exchangeInfo",
+        "trade_stream": "trade",
     },
     "BINANCE SPOT": {
         "label": "Binance Spot",
@@ -34,6 +35,7 @@ EXCHANGES = {
         "rest_base": "https://api.binance.com",
         "depth_path": "/api/v3/depth",
         "exchange_info_path": "/api/v3/exchangeInfo",
+        "trade_stream": "trade",
     },
     "ASTERDEX": {
         "label": "AsterDEX",
@@ -57,13 +59,15 @@ DEPTH_SPEED = "100ms"
 class ExchangeWSManager:
     """Один экземпляр = одно подключение к одной Binance-style бирже."""
 
-    def __init__(self, exchange: str, on_depth_update, on_status):
+    def __init__(self, exchange: str, on_depth_update, on_status, on_trade_update=None):
         cfg = EXCHANGES[exchange]
         self.exchange = exchange
         self.label = cfg["label"]
         self.ws_base = cfg["ws_base"]
         self.rest_base = cfg["rest_base"]
+        self.trade_stream = cfg.get("trade_stream")
         self.on_depth_update = on_depth_update  # callback(exchange, symbol, event_dict)
+        self.on_trade_update = on_trade_update  # callback(exchange, symbol, agg_trade_dict)
         self.on_status = on_status
         self.loop = None
         self.thread = None
@@ -75,6 +79,13 @@ class ExchangeWSManager:
         self._req_id = 1
 
     # ---------- публичное API ----------
+
+    def _streams_for_symbol(self, symbol: str):
+        symbol = symbol.lower()
+        streams = [f"{symbol}@depth@{DEPTH_SPEED}"]
+        if self.trade_stream:
+            streams.append(f"{symbol}@{self.trade_stream}")
+        return streams
 
     def start(self):
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -89,21 +100,22 @@ class ExchangeWSManager:
                 pass
 
     def subscribe_symbol(self, symbol: str):
-        stream = f"{symbol.lower()}@depth@{DEPTH_SPEED}"
+        streams = self._streams_for_symbol(symbol)
         with self._lock:
-            self._desired_streams.add(stream)
+            self._desired_streams.update(streams)
         dlog(f"[{self.label}] subscribe_symbol({symbol}) loop_ready={self.loop is not None} ws_ready={self.ws is not None}")
         if self.loop:
-            asyncio.run_coroutine_threadsafe(self._subscribe([stream]), self.loop)
+            asyncio.run_coroutine_threadsafe(self._subscribe(streams), self.loop)
         # если loop ещё не поднят — стрим всё равно уйдёт в ?streams= при
         # первом коннекте (см. _main), запрос не теряется
 
     def unsubscribe_symbol(self, symbol: str):
-        stream = f"{symbol.lower()}@depth@{DEPTH_SPEED}"
+        streams = self._streams_for_symbol(symbol)
         with self._lock:
-            self._desired_streams.discard(stream)
+            for stream in streams:
+                self._desired_streams.discard(stream)
         if self.loop:
-            asyncio.run_coroutine_threadsafe(self._unsubscribe([stream]), self.loop)
+            asyncio.run_coroutine_threadsafe(self._unsubscribe(streams), self.loop)
 
     # ---------- внутреннее ----------
 
@@ -182,6 +194,9 @@ class ExchangeWSManager:
                 if "@depth" in stream:
                     symbol = stream.split("@")[0].upper()
                     self.on_depth_update(self.exchange, symbol, data)
+                elif self.trade_stream and stream.endswith(f"@{self.trade_stream}") and self.on_trade_update:
+                    symbol = stream.split("@")[0].upper()
+                    self.on_trade_update(self.exchange, symbol, data)
             elif msg_count <= 5:
                 dlog(f"[{self.label}] сообщение не depth-формата (например ack подписки): {msg}")
 

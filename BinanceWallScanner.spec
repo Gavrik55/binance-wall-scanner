@@ -8,8 +8,14 @@ PYTHON_DIR = sys.base_prefix
 DLLS_DIR = os.path.join(PYTHON_DIR, 'DLLs')
 TKINTER_DIR = os.path.join(PYTHON_DIR, 'Lib', 'tkinter')
 RUNTIME_ROOT = os.environ.get('TCLTK_RUNTIME_DIR', r'C:\TMM_Cutter\runtime')
-TCL_DIR = os.environ.get('TCL_LIBRARY', os.path.join(RUNTIME_ROOT, 'tcl8.6'))
-TK_DIR = os.environ.get('TK_LIBRARY', os.path.join(RUNTIME_ROOT, 'tk8.6'))
+DEFAULT_TCL_DIR = os.path.join(RUNTIME_ROOT, 'tcl8.6')
+DEFAULT_TK_DIR = os.path.join(RUNTIME_ROOT, 'tk8.6')
+if not os.path.exists(os.path.join(DEFAULT_TCL_DIR, 'init.tcl')):
+    DEFAULT_TCL_DIR = os.path.join(PYTHON_DIR, 'tcl', 'tcl8.6')
+if not os.path.exists(os.path.join(DEFAULT_TK_DIR, 'tk.tcl')):
+    DEFAULT_TK_DIR = os.path.join(PYTHON_DIR, 'tcl', 'tk8.6')
+TCL_DIR = os.environ.get('TCL_LIBRARY', DEFAULT_TCL_DIR)
+TK_DIR = os.environ.get('TK_LIBRARY', DEFAULT_TK_DIR)
 TKINTER_BINARIES = [
     (os.path.join(DLLS_DIR, '_tkinter.pyd'), '.'),
     (os.path.join(DLLS_DIR, 'tcl86t.dll'), '.'),
@@ -28,7 +34,13 @@ a = Analysis(
     pathex=[],
     binaries=TKINTER_BINARIES,
     datas=TKINTER_DATAS,
-    hiddenimports=['_tkinter'],
+    hiddenimports=[
+        'tkinter',
+        'tkinter.ttk',
+        'tkinter.messagebox',
+        'tkinter.filedialog',
+        '_tkinter',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

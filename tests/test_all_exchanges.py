@@ -31,12 +31,13 @@ root = tk.Tk()
 app = guimod.App(root)
 
 values = app.exchange_combo.cget("values")
-print("exchange combo values:", values)
+print("exchange combo values:", [str(v).encode("unicode_escape").decode("ascii") for v in values])
 assert guimod.ALL_EXCHANGES_LABEL in values
 for exch in guimod.BASE_EXCHANGE_CHOICES:
     assert exch in values
 for exch in guimod.SPOT_EXCHANGE_BY_BASE.values():
-    assert exch not in values, "spot/futures не должны быть отдельным выбором в UI"
+    assert exch in values, "spot/futures должны быть отдельным выбором в UI"
+assert "BINANCE ALPHA" in values
 
 fake_results = {exch: False for exch in guimod.EXCHANGE_CHOICES}
 fake_results.update({"BINANCE": True, "BINANCE SPOT": True})
@@ -51,19 +52,21 @@ app._add_symbol()
 def check_step1():
     print("orderbooks keys:", list(app.orderbooks.keys()))
     assert "BINANCE:FAKEUSDT" in app.orderbooks, "должен добавиться на BINANCE (валидатор вернул True)"
-    assert "BINANCE SPOT:FAKEUSDT" in app.orderbooks, "должен добавиться на BINANCE SPOT (валидатор вернул True)"
+    assert "BINANCE SPOT:FAKEUSDT" not in app.orderbooks, "BINANCE теперь отдельный futures-выбор без spot"
     assert "ASTERDEX:FAKEUSDT" not in app.orderbooks, "НЕ должен добавиться на ASTERDEX (валидатор вернул False)"
     assert "GATE:FAKEUSDT" not in app.orderbooks, "НЕ должен добавиться на GATE (это другой базовый выбор)"
-    print("OK: базовый выбор BINANCE добавляет futures+spot, но не остальные биржи")
-
-    print("status_var:", app.status_var.get())
-    assert "BINANCE" in app.status_var.get() and "BINANCE SPOT" in app.status_var.get()
-    print("OK: статус-бар сообщает, на каких биржах добавлено")
+    print("OK: выбор BINANCE добавляет только futures")
 
     cfg_b = app.detector.configs["BINANCE:FAKEUSDT"]
-    cfg_s = app.detector.configs["BINANCE SPOT:FAKEUSDT"]
-    assert cfg_b.threshold_usd == 50000.0 and cfg_s.threshold_usd == 50000.0
-    print("OK: общие параметры (порог) применились на обеих добавленных биржах")
+    assert cfg_b.threshold_usd == 50000.0
+    print("OK: параметры применились к точному рынку")
+
+    app.symbol_entry.insert(0, "FAKESPOTUSDT")
+    app.threshold_entry.insert(0, "25000")
+    app.exchange_combo.set("BINANCE SPOT")
+    app._add_symbol()
+    assert "BINANCE SPOT:FAKESPOTUSDT" in app.orderbooks
+    print("OK: spot можно добавить отдельным выбором")
 
     # --- шаг 2: тест "все биржи" по всем concrete-рынкам ---
     fake_results2 = {exch: False for exch in guimod.EXCHANGE_CHOICES}
