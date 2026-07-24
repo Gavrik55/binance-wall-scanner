@@ -196,5 +196,37 @@ app.root.focus_get = orig_focus_get
 app._remove_symbol()
 print("OK: горячие клавиши не крадут нажатия у текстовых полей")
 
+# --- 7) autocomplete popup: hover highlight + wheel/scrollbar ---
+with app._symbol_suggestion_lock:
+    app._symbol_suggestion_set = {f"COIN{i:02d}USDT" for i in range(30)}
+app.symbol_entry.delete(0, "end")
+app.symbol_entry.insert(0, "COIN")
+assert app._show_symbol_suggestions(), "autocomplete popup should open for matching symbols"
+root.update()
+assert app.symbol_suggest.size() == 30, app.symbol_suggest.size()
+assert int(app.symbol_suggest.cget("height")) == 8, app.symbol_suggest.cget("height")
+assert app.symbol_suggest_scroll.winfo_ismapped(), "autocomplete scrollbar should be visible"
+
+app.symbol_suggest.yview_moveto(0)
+root.update()
+yview_before = app.symbol_suggest.yview()
+wheel_event = FakeMouseEvent()
+wheel_event.delta = -120
+app._scroll_symbol_suggestions(wheel_event)
+root.update()
+assert app.symbol_suggest.yview()[0] > yview_before[0], "mouse wheel should scroll autocomplete list"
+
+app.symbol_suggest.yview_moveto(0)
+root.update()
+bbox = app.symbol_suggest.bbox(2)
+assert bbox, "third autocomplete row should be visible"
+hover_event = FakeMouseEvent()
+hover_event.y = bbox[1] + max(1, bbox[3] // 2)
+app._hover_symbol_suggestion(hover_event)
+assert app.symbol_suggest.curselection() == (2,), app.symbol_suggest.curselection()
+assert app.symbol_suggest.get(2) == "COIN02USDT"
+app._hide_symbol_suggestions()
+print("OK: autocomplete popup highlights hovered rows and scrolls with the mouse wheel")
+
 root.destroy()
 print("\nALL CLIPBOARD COPY TESTS PASSED")

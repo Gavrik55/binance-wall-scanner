@@ -487,13 +487,24 @@ class App:
         self.symbol_suggest_popup.withdraw()
         self.symbol_suggest_popup.overrideredirect(True)
         self.symbol_suggest_popup.configure(bg="#111827")
-        self.symbol_suggest = tk.Listbox(self.symbol_suggest_popup, height=6, width=20, bg="#111827", fg="white",
-                                         selectbackground="#2563eb", activestyle="none",
+        self.symbol_suggest_frame = tk.Frame(self.symbol_suggest_popup, bg="#111827")
+        self.symbol_suggest_frame.pack(fill="both", expand=True)
+        self.symbol_suggest = tk.Listbox(self.symbol_suggest_frame, height=6, width=20, bg="#111827", fg="white",
+                                         selectbackground="#e5e7eb", selectforeground="#111827",
+                                         activestyle="none",
                                          highlightthickness=1, highlightbackground="#374151")
-        self.symbol_suggest.pack(fill="both", expand=True)
+        self.symbol_suggest_scroll = tk.Scrollbar(self.symbol_suggest_frame, orient="vertical",
+                                                  command=self.symbol_suggest.yview)
+        self.symbol_suggest.configure(yscrollcommand=self.symbol_suggest_scroll.set)
+        self.symbol_suggest.pack(side="left", fill="both", expand=True)
+        self.symbol_suggest_scroll.pack(side="right", fill="y")
         self.symbol_suggest.bind("<ButtonRelease-1>", self._choose_symbol_suggestion)
         self.symbol_suggest.bind("<Return>", self._choose_symbol_suggestion)
         self.symbol_suggest.bind("<Escape>", lambda _e: self._hide_symbol_suggestions())
+        self.symbol_suggest.bind("<Motion>", self._hover_symbol_suggestion)
+        self.symbol_suggest.bind("<MouseWheel>", self._scroll_symbol_suggestions)
+        self.symbol_suggest.bind("<Button-4>", self._scroll_symbol_suggestions)
+        self.symbol_suggest.bind("<Button-5>", self._scroll_symbol_suggestions)
 
         tk.Label(top, text="Объём:", bg="#0a0a0d", fg="white").grid(row=0, column=4, padx=4, sticky="w")
         self.volume_preset_combo = ttk.Combobox(top, values=[p[0] for p in VOLUME_PRESETS],
@@ -1006,6 +1017,36 @@ class App:
         self.symbol_entry.focus_set()
         return "break"
 
+    def _hover_symbol_suggestion(self, event):
+        if not getattr(self, "symbol_suggest", None) or self.symbol_suggest.size() <= 0:
+            return None
+        index = self.symbol_suggest.nearest(event.y)
+        bbox = self.symbol_suggest.bbox(index)
+        if not bbox:
+            return None
+        _x, y, _w, h = bbox
+        if y <= event.y <= y + h:
+            self.symbol_suggest.selection_clear(0, "end")
+            self.symbol_suggest.selection_set(index)
+            self.symbol_suggest.activate(index)
+        return None
+
+    def _scroll_symbol_suggestions(self, event):
+        if not getattr(self, "symbol_suggest", None):
+            return "break"
+        if getattr(event, "num", None) == 4:
+            units = -1
+        elif getattr(event, "num", None) == 5:
+            units = 1
+        else:
+            delta = getattr(event, "delta", 0)
+            units = -1 * int(delta / 120) if delta else 0
+            if units == 0 and delta:
+                units = -1 if delta > 0 else 1
+        if units:
+            self.symbol_suggest.yview_scroll(units, "units")
+        return "break"
+
     def _hide_symbol_suggestions(self):
         if hasattr(self, "symbol_suggest_popup"):
             self.symbol_suggest_popup.withdraw()
@@ -1032,17 +1073,17 @@ class App:
             plain = symbol.replace("_", "")
             if symbol.startswith(raw) or plain.startswith(raw) or symbol.startswith(normalized):
                 matches.append(symbol)
-        matches = sorted(matches)[:20]
+        matches = sorted(matches)[:80]
         self.symbol_suggest.delete(0, "end")
         for symbol in matches:
             self.symbol_suggest.insert("end", symbol)
         if matches:
-            visible_rows = min(6, len(matches))
+            visible_rows = min(8, len(matches))
             self.symbol_suggest.config(height=visible_rows)
             self.root.update_idletasks()
             x = self.symbol_entry.winfo_rootx()
             y = self.symbol_entry.winfo_rooty() + self.symbol_entry.winfo_height()
-            width = max(self.symbol_entry.winfo_width(), 180)
+            width = max(self.symbol_entry.winfo_width(), 220)
             row_height = max(18, self.symbol_suggest.winfo_reqheight() // max(visible_rows, 1))
             height = (row_height * visible_rows) + 4
             self.symbol_suggest_popup.geometry(f"{width}x{height}+{x}+{y}")
