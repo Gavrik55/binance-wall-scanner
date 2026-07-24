@@ -41,14 +41,18 @@ def on_update(tickers):
 def on_status(text):
     print("STATUS:", text)
 
-scanner = market_scan.MarketScanner(on_update, on_status)
+# Ограничиваем ОДНОЙ биржей: после добавления spot-клонов и MEXC полный обход
+# FETCHERS занимает ~10 запросов и цикл длится дольше интервала — тест по
+# всем биржам стал бы флаки. Нас интересует сам факт периодического опроса и
+# расчёт impulse_pct, для этого хватает одной быстрой биржи.
+scanner = market_scan.MarketScanner(on_update, on_status, exchanges=["BINANCE"])
 # для теста ускоряем опрос, чтобы не ждать реальные 15 сек
 market_scan.POLL_INTERVAL_SEC = 3.0
 scanner.start()
-time.sleep(8)  # дождёмся минимум 2 цикла опроса
+time.sleep(10)  # при интервале 3с и быстрой одиночной бирже уложатся 2+ цикла
 scanner.stop()
 
-assert len(received) >= 2, f"ожидалось минимум 2 цикла опроса за 8 сек при интервале 3с, получено {len(received)}"
+assert len(received) >= 2, f"ожидалось минимум 2 цикла опроса за 10 сек, получено {len(received)}"
 last_batch = received[-1]
 sample = last_batch[0]
 print("пример тикера после 2+ циклов:", sample)
