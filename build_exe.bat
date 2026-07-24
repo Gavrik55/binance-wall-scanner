@@ -99,10 +99,20 @@ if not exist "dist\BinanceWallScanner-Standalone.exe" (
     exit /b 1
 )
 
+if defined BUILD_VERSION (
+    if not exist "dist-versioned" mkdir "dist-versioned"
+    copy /Y "dist\BinanceWallScanner-Standalone.exe" "dist\BinanceWallScanner-%BUILD_VERSION%.exe" >nul
+    copy /Y "dist\BinanceWallScanner-Standalone.exe" "dist-versioned\BinanceWallScanner-%BUILD_VERSION%.exe" >nul
+)
+
 echo.
 echo === Done ===
 echo Onedir:     dist\BinanceWallScanner\BinanceWallScanner.exe
 echo Standalone: dist\BinanceWallScanner-Standalone.exe
+if defined BUILD_VERSION (
+    echo Versioned:  dist\BinanceWallScanner-%BUILD_VERSION%.exe
+    echo Archive:    dist-versioned\BinanceWallScanner-%BUILD_VERSION%.exe
+)
 echo Config files were restored after build.
 if not defined NO_PAUSE pause
 exit /b 0

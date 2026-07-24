@@ -84,3 +84,24 @@ build.bat
 Готовый запуск:
 - dist\BinanceWallScanner\BinanceWallScanner.exe
 ```
+
+## 8. Подробности сборки для нейронки
+
+Если сборку делает Codex/Claude, сначала открыть `BUILDING.md`.
+
+Короткий вариант команды для свежего exe с номером версии:
+
+```powershell
+$env:NO_PAUSE = '1'
+$env:SKIP_PIP = '1'
+$env:BUILD_VERSION = 'v0.2.5-beta'
+$env:TCL_LIBRARY = 'C:\TMM_Cutter\runtime\tcl8.6'
+$env:TK_LIBRARY = 'C:\TMM_Cutter\runtime\tk8.6'
+cmd /c build_exe.bat
+```
+
+Ожидаемые файлы:
+
+- `dist\BinanceWallScanner-Standalone.exe`
+- `dist\BinanceWallScanner-v0.2.5-beta.exe`
+- `dist-versioned\BinanceWallScanner-v0.2.5-beta.exe`
