@@ -12,8 +12,13 @@ if os.path.exists(guimod.CONFIG_FILE):
 root = tk.Tk()
 app = guimod.App(root)
 print("App created OK, tabs:", app.notebook.tabs())
-assert app.hedgehog_scanner._fetchers.keys() == {"BINANCE", "BYBIT"}, app.hedgehog_scanner._fetchers.keys()
-print("OK: hedgehog_scanner ограничен BINANCE+BYBIT")
+# После слияния с работой Codex "Ерши" опрашивают futures BINANCE+BYBIT ПЛЮС
+# spot-рынки (BINANCE/ASTERDEX/GATE/OKX SPOT) — это фича Codex. Главное для нас:
+# MEXC в "Ерши" НЕ попадает (по требованию пользователя оставить Ерши как есть).
+hh_keys = set(app.hedgehog_scanner._fetchers.keys())
+assert hh_keys == set(guimod.HEDGEHOG_EXCHANGES), hh_keys
+assert "MEXC" not in hh_keys, "MEXC не должен попадать в Ерши"
+print("OK: hedgehog_scanner = HEDGEHOG_EXCHANGES (futures+spot), без MEXC")
 
 fake_tickers = [
     {"exchange": "BINANCE", "symbol": "TIGHTUSDT", "last": 1.0, "hh_ready": True,
