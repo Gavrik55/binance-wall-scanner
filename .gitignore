@@ -1,39 +1,49 @@
-# Python cache and test artifacts
+# --- Python ---
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 htmlcov/
 
-# Virtual environments and local dependency folders
+# --- Виртуальные окружения ---
 .venv/
 venv/
 env/
 ENV/
 
-# PyInstaller build output
-build/
-dist/
+# --- Личные настройки пользователя (у каждого свой список монет) ---
+config.json
+impulse_settings.json
+wall_scanner_config*.json
 
-# Packaged binaries and runtime files
+# --- Сборка PyInstaller ---
+dist/
+build/
 *.exe
+
+# --- Записанные данные и логи (генерируются на лету, тяжёлые) ---
+depth_data/
+debug_packs/
 debug.log
 *.log
-impulse_settings.json
 
-# Local editor and OS files
+# --- Скриншоты / картинки ---
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# --- Редакторы / ОС / временные ---
 .idea/
 .vscode/
 *.swp
 *.swo
+*.bak
+*.tmp
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Temporary exported configs/backups
-wall_scanner_config*.json
-*.bak
-*.tmp

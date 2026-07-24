@@ -45,10 +45,14 @@ scanner = market_scan.MarketScanner(on_update, on_status)
 # для теста ускоряем опрос, чтобы не ждать реальные 15 сек
 market_scan.POLL_INTERVAL_SEC = 3.0
 scanner.start()
-time.sleep(8)  # дождёмся минимум 2 цикла опроса
+# Сам обход 6 бирж занимает ~4с (медленнее всех Gate.io, ~2с из них), то есть
+# больше выставленного интервала — при elapsed > POLL_INTERVAL_SEC цикл всё
+# равно спит минимум 1с, поэтому итерация выходит ~5с. Ждём 14с, чтобы
+# гарантированно уложились два полных цикла с запасом.
+time.sleep(14)
 scanner.stop()
 
-assert len(received) >= 2, f"ожидалось минимум 2 цикла опроса за 8 сек при интервале 3с, получено {len(received)}"
+assert len(received) >= 2, f"ожидалось минимум 2 цикла опроса за 14 сек, получено {len(received)}"
 last_batch = received[-1]
 sample = last_batch[0]
 print("пример тикера после 2+ циклов:", sample)

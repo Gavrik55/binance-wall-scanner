@@ -25,7 +25,14 @@ from market_scan import (
     IMPULSE_HIGHLIGHT_PCT as MARKET_IMPULSE_HIGHLIGHT_PCT,
     TOP_N as MARKET_TOP_N,
     HEDGEHOG_WINDOW_SEC,
+    EARLY_RANGE_MIN_PCT,
+    EARLY_RANGE_MAX_PCT,
+    EARLY_VOL_MIN_USD,
+    EARLY_VOL_MAX_USD,
+    EARLY_ACCEL_MAX,
+    OI_RISE_HIGHLIGHT_PCT,
 )
+from depth_recorder import DepthRecorder
 
 # В обычном запуске (python main.py) конфиг лежит рядом со скриптом.
 # В собранном PyInstaller-экзешнике __file__ указывает во временную папку
@@ -116,6 +123,14 @@ IMPULSE_WINDOW_MAX_SEC = 1800.0  # 30 мин — с запасом ниже HIST
 IMPULSE_TOAST_MS = 8000          # сколько всплывающее окно висит перед авто-закрытием
 IMPULSE_TOAST_W, IMPULSE_TOAST_H = 280, 58
 IMPULSE_SETTINGS_FILE = os.path.join(_APP_DIR, "impulse_settings.json")  # отдельный файл — config.json это список монет, а не dict настроек
+
+# "Ранние" (вотч-лист живой тишины). Монета должна продержаться в профиле
+# EARLY_CONFIRM_TICKS сканов подряд, прежде чем дать алерт — иначе те, кто
+# болтается на границе порога (диапазон 2.9% / 3.1%), моргали бы алертом
+# каждые 15 секунд. Та же логика подтверждения, что у плотностей в detector.py.
+EARLY_CONFIRM_TICKS = 3
+EARLY_REALERT_SEC = 3 * 3600     # повторный алерт по той же монете — не раньше чем через 3ч
+EARLY_DEPTH_DIR = os.path.join(_APP_DIR, "depth_data")
 
 
 _CHIME_CACHE = {}  # freq -> готовый WAV (bytes), чтобы не пересинтезировать на каждый алерт
@@ -211,6 +226,15 @@ class App:
         self._active_impulse_toasts = []  # список открытых Toplevel-тостов, для стека/перепозиционирования
         self._load_impulse_settings()
 
+        # "Ранние" — вотч-лист монет в "живой тишине" (профиль до памп-выноса)
+        self.early_alerts_enabled = tk.BooleanVar(value=True)
+        # по умолчанию включено: монеты, уже торгующиеся на Binance/OKX/Bybit,
+        # имеют толстый стакан и на +50% с тонкой книги не выносятся
+        self.early_exclusive_only = tk.BooleanVar(value=True)
+        self._early_streak = {}     # symbol -> сколько сканов подряд держится в профиле
+        self._early_alerted = {}    # symbol -> когда последний раз алертили (антиповтор)
+        self.depth_recorder = DepthRecorder(EARLY_DEPTH_DIR, self._on_status)
+
         self._build_ui()
         self._load_config()
         self.root.after(100, self._poll_queue)
@@ -227,6 +251,15 @@ class App:
         self.hedgehog_scanner = MarketScanner(self._on_hedgehog_update, self._on_status,
                                                exchanges=["BINANCE", "BYBIT"])
         self.hedgehog_scanner.start()
+
+        # запись стаканов по вотч-листу — единственный способ получить историю
+        # стакана перед пампом, её нельзя добрать задним числом (см. depth_recorder.py)
+        self.depth_recorder.start()
+
+        # прогрев "Ранних" минутными свечами: без него вкладка пустая первый час
+        # после каждого запуска, то есть ни алертов, ни записи стаканов
+        threading.Thread(target=self.market_scanner.bootstrap_mexc_history,
+                         daemon=True).start()
 
     # ---------------- UI ----------------
 
@@ -247,9 +280,11 @@ class App:
         tab_scanner = tk.Frame(self.notebook, bg="#0a0a0d")
         tab_movers = tk.Frame(self.notebook, bg="#0a0a0d")
         tab_hedgehog = tk.Frame(self.notebook, bg="#0a0a0d")
+        tab_early = tk.Frame(self.notebook, bg="#0a0a0d")
         self.notebook.add(tab_scanner, text="Сканер плотностей")
         self.notebook.add(tab_movers, text="Топ движений")
         self.notebook.add(tab_hedgehog, text="🦔 Ерши")
+        self.notebook.add(tab_early, text="🎯 Ранние")
 
         top = tk.Frame(tab_scanner, bg="#0a0a0d")
         top.pack(fill="x", padx=10, pady=(10, 4))
@@ -400,6 +435,7 @@ class App:
 
         self._build_movers_tab(tab_movers)
         self._build_hedgehog_tab(tab_hedgehog)
+        self._build_early_tab(tab_early)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(10, 0))
 
         status_bar = tk.Label(self.root, textvariable=self.status_var,
@@ -521,6 +557,62 @@ class App:
         self.hedgehog_tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         self.hedgehog_tree.bind("<Double-1>", lambda e: self._copy_symbol_from_tree(self.hedgehog_tree, 1))
+
+    def _build_early_tab(self, parent):
+        """Вкладка «🎯 Ранние»: монеты MEXC в состоянии "живой тишины" — тот
+        профиль, который был у 7 из 9 размеченных пампов за час до старта
+        (узкий, но не мёртвый диапазон + низкий объём, который не разгоняется).
+
+        ВАЖНО понимать, что это вотч-лист, а не сигнал на вход: под профиль
+        подходит ~5% рынка, а стреляют единицы. Смысл вкладки — сузить рынок
+        с ~1800 пар до нескольких десятков, по которым параллельно пишутся
+        стаканы (depth_recorder.py), чтобы потом проверить главную гипотезу:
+        предсказывают ли памп неснимаемые плотности."""
+        hint = tk.Label(parent,
+                         text=f"MEXC. Профиль за час: диапазон {EARLY_RANGE_MIN_PCT:g}–{EARLY_RANGE_MAX_PCT:g}%, "
+                              f"объём ${EARLY_VOL_MIN_USD:,}–${EARLY_VOL_MAX_USD:,}, "
+                              f"без разгона (<{EARLY_ACCEL_MAX:g}x). "
+                              "Это вотч-лист для наблюдения, а не сигнал на вход. "
+                              "Первый час после запуска — прогрев. Двойной клик — копировать тикер.",
+                         bg="#0a0a0d", fg="#6b7078", font=("Segoe UI", 9), justify="left")
+        hint.pack(anchor="w", padx=4, pady=(8, 4))
+
+        bar = tk.Frame(parent, bg="#0a0a0d")
+        bar.pack(fill="x", padx=4, pady=(0, 4))
+        tk.Checkbutton(bar, text="🔔 Алерт при появлении новой монеты", variable=self.early_alerts_enabled,
+                        bg="#0a0a0d", fg="white", selectcolor="#131316",
+                        activebackground="#0a0a0d", activeforeground="white").pack(side="left")
+        tk.Checkbutton(bar, text="🚫 Только эксклюзивы (без Binance/OKX/Bybit)",
+                        variable=self.early_exclusive_only,
+                        bg="#0a0a0d", fg="white", selectcolor="#131316",
+                        activebackground="#0a0a0d", activeforeground="white").pack(side="left", padx=(12, 0))
+        self.early_status_var = tk.StringVar(value="прогрев...")
+        tk.Label(bar, textvariable=self.early_status_var, bg="#0a0a0d", fg="#6b7078",
+                 font=("Segoe UI", 9)).pack(side="left", padx=16)
+
+        ecols = ("symbol", "last", "range", "vol60", "accel", "change24", "oi", "oi_chg", "also_on")
+        eheaders = {"symbol": "Символ", "last": "Цена", "range": "Диапазон 60м",
+                    "vol60": "Объём 60м $", "accel": "Разгон", "change24": "24ч %",
+                    "oi": "OI $", "oi_chg": "OI Δ60м", "also_on": "Ещё на"}
+        ewidths = {"symbol": 140, "last": 110, "range": 100, "vol60": 110,
+                   "accel": 80, "change24": 80, "oi": 100, "oi_chg": 90, "also_on": 120}
+
+        frame = tk.Frame(parent, bg="#0a0a0d")
+        frame.pack(fill="both", expand=True, padx=4, pady=(0, 8))
+        self.early_tree = ttk.Treeview(frame, columns=ecols, show="headings")
+        for c in ecols:
+            self.early_tree.heading(c, text=eheaders[c])
+            self.early_tree.column(c, width=ewidths[c], anchor="center")
+        # чем уже диапазон, тем "сжатее" пружина — подсветим самых тихих
+        self.early_tree.tag_configure("tight", foreground=EVENT_COLORS["CASCADE"])
+        self.early_tree.tag_configure("normal", foreground="white")
+        # растущий OI важнее сжатости — отдельный яркий цвет, перекрывает tight
+        self.early_tree.tag_configure("oi_rising", foreground=EVENT_COLORS["MAGNET"])
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.early_tree.yview)
+        self.early_tree.configure(yscrollcommand=scroll.set)
+        self.early_tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.early_tree.bind("<Double-1>", lambda e: self._copy_symbol_from_tree(self.early_tree, 0))
 
     # ---------------- управление монетами ----------------
 
@@ -1035,12 +1127,18 @@ class App:
     # ---------------- топ движений рынка ----------------
 
     def _update_movers_trees(self, tickers):
-        gainers, losers = MarketScanner.top_movers(tickers, n=MARKET_TOP_N)
+        # MEXC живёт ТОЛЬКО во вкладке "Ранние" — из "Топ движений" и из
+        # импульсных алертов он исключён (по просьбе: MEXC там забивал списки
+        # мусорными микрокапами). В фоне MEXC всё равно опрашивается — он нужен
+        # "Ранним", которым передаётся полный батч ниже.
+        non_mexc = [t for t in tickers if t.get("exchange") != "MEXC"]
+        gainers, losers = MarketScanner.top_movers(non_mexc, n=MARKET_TOP_N)
         self._fill_movers_tree(self.gainers_tree, gainers, "up")
         self._fill_movers_tree(self.losers_tree, losers, "down")
-        # алерты — по ВСЕМУ рынку, а не только по топ-20 роста/падения за
-        # 24ч: монета может дать импульс за 3 мин, не будучи в топе за сутки
-        self._check_impulse_alerts(tickers)
+        # алерты — по ВСЕМУ рынку (кроме MEXC), а не только по топ-20 роста/
+        # падения за 24ч: монета может дать импульс за 3 мин, не будучи в топе
+        self._check_impulse_alerts(non_mexc)
+        self._update_early_tree(tickers)
 
     def _fill_movers_tree(self, tree, rows, default_tag):
         tree.delete(*tree.get_children())
@@ -1227,6 +1325,117 @@ class App:
         self.status_var.set(f"Добавлено в сканер (AUTO) и скопировано в буфер: {exchange}:{symbol}")
         self.notebook.select(0)
 
+    # ---------------- ранние кандидаты (живая тишина) ----------------
+
+    def _update_early_tree(self, tickers):
+        candidates = MarketScanner.early_candidates(
+            tickers, exchange="MEXC",
+            exclude_majors=self.early_exclusive_only.get(),
+            binance_spot_symbols=self.market_scanner.binance_spot_symbols)
+        warming = not any(t.get("early_ready") for t in tickers if t.get("exchange") == "MEXC")
+
+        self.early_tree.delete(*self.early_tree.get_children())
+        for c in candidates:
+            # самые сжатые (ближе к нижней границе диапазона) — подсвечиваем
+            tight = c["range_60m"] <= (EARLY_RANGE_MIN_PCT + EARLY_RANGE_MAX_PCT) / 2
+            also = ", ".join(c.get("also_on") or []) or "— только MEXC"
+
+            # OI: прочерк для спотовых без фьючерса; растущий OI — отдельная подсветка
+            oi_change = c.get("oi_change_pct", 0.0)
+            if c.get("has_oi"):
+                oi_str = f"${c['oi_usd']:,.0f}"
+                oi_chg_str = f"{oi_change:+.0f}%"
+            else:
+                oi_str = "—"
+                oi_chg_str = "—"
+            rising = c.get("has_oi") and oi_change >= OI_RISE_HIGHLIGHT_PCT
+            tag = "oi_rising" if rising else ("tight" if tight else "normal")
+
+            self.early_tree.insert("", "end", iid=c["symbol"], values=(
+                c["symbol"], f"{c['last']:g}", f"{c['range_60m']:.1f}%",
+                f"${c['vol_60m']:,.0f}", f"{c['vol_accel']:.2f}x",
+                f"{c['change_pct_24h']:+.1f}%", oi_str, oi_chg_str, also,
+            ), tags=(tag,))
+
+        symbols = [c["symbol"] for c in candidates]
+        # вотч-лист рекордера идёт следом за таблицей: пишем стаканы ровно по
+        # тем монетам, которые сейчас в профиле
+        self.depth_recorder.set_watchlist(symbols)
+
+        if warming:
+            self.early_status_var.set("прогрев: копится час истории...")
+        else:
+            self.early_status_var.set(
+                f"кандидатов: {len(symbols)} | снимков стакана записано: "
+                f"{self.depth_recorder.snapshots_written:,}")
+
+        if not warming:
+            self._check_early_alerts(symbols)
+
+    def _check_early_alerts(self, symbols):
+        """Алерт на монету, которая ВОШЛА в профиль и удержалась в нём
+        EARLY_CONFIRM_TICKS сканов подряд. Без этой выдержки монеты, болтающиеся
+        на границе порога, моргали бы алертом каждые 15 секунд."""
+        current = set(symbols)
+        for symbol in list(self._early_streak):
+            if symbol not in current:
+                del self._early_streak[symbol]  # выпала из профиля — счётчик сбрасывается
+
+        if not self.early_alerts_enabled.get():
+            for symbol in current:
+                self._early_streak[symbol] = self._early_streak.get(symbol, 0) + 1
+            return
+
+        now = time.time()
+        for symbol in symbols:
+            streak = self._early_streak.get(symbol, 0) + 1
+            self._early_streak[symbol] = streak
+            if streak != EARLY_CONFIRM_TICKS:
+                continue  # ровно на подтверждающем тике, дальше молчим
+            if now - self._early_alerted.get(symbol, 0) < EARLY_REALERT_SEC:
+                continue
+            self._early_alerted[symbol] = now
+            self._show_early_toast(symbol)
+            if self.impulse_sound_enabled.get():
+                threading.Thread(target=_play_beep, args=("WALL",), daemon=True).start()
+
+    def _show_early_toast(self, symbol):
+        """Всплывашка про нового кандидата. Отдельный вид от импульсной — тут
+        не «уже летит», а «встало в профиль, стоит посмотреть стакан»."""
+        row = None
+        if self.early_tree.exists(symbol):
+            row = self.early_tree.item(symbol, "values")
+
+        color = EVENT_COLORS["CASCADE"]
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        toast.configure(bg=color)
+        inner = tk.Frame(toast, bg="#1f1f24")
+        inner.pack(fill="both", expand=True, padx=2, pady=2)
+        tk.Label(inner, text=f"🎯 Ранний кандидат  MEXC", bg="#1f1f24", fg=color,
+                 font=("Segoe UI", 10, "bold"), anchor="w").pack(fill="x", padx=10, pady=(8, 0))
+        detail = f"{symbol}"
+        if row:
+            detail += f"   диап. {row[2]}  объём {row[3]}"
+        tk.Label(inner, text=detail, bg="#1f1f24", fg="white",
+                 font=("Segoe UI", 9), anchor="w").pack(fill="x", padx=10, pady=(0, 8))
+
+        def _on_click(_event=None):
+            self.notebook.select(3)  # вкладка "🎯 Ранние"
+            self.root.clipboard_clear()
+            self.root.clipboard_append(symbol)
+            self.status_var.set(f"Ранний кандидат: {symbol} скопирован в буфер")
+            self._remove_impulse_toast(toast)
+
+        toast.bind("<Button-1>", _on_click)
+        for w in (inner, *inner.winfo_children()):
+            w.bind("<Button-1>", _on_click)
+
+        self._active_impulse_toasts.append(toast)
+        self._reposition_impulse_toasts()
+        toast.after(IMPULSE_TOAST_MS, lambda: self._remove_impulse_toast(toast))
+
     def _update_hedgehog_tree(self, tickers):
         candidates = MarketScanner.hedgehog_candidates(tickers, n=30)
         self.hedgehog_tree.delete(*self.hedgehog_tree.get_children())
@@ -1351,6 +1560,7 @@ class App:
             mgr.stop()
         self.market_scanner.stop()
         self.hedgehog_scanner.stop()
+        self.depth_recorder.stop()
         self._save_config()
         self._save_impulse_settings()
         self.root.destroy()
