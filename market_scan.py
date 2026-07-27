@@ -48,6 +48,9 @@ HEDGEHOG_MIN_SAMPLES = 30           # минимум точек в окне, ч�
 HEDGEHOG_TOUCH_TOLERANCE_PCT = 15.0 # "касанием" границы диапазона считаем попадание в ближайшие N% от его ширины
 HEDGEHOG_VOL_60M_SEC = 60 * 60
 HEDGEHOG_VOL_10M_SEC = 10 * 60
+HEDGEHOG_EVENT_EXCHANGES = ("BINANCE", "BYBIT")
+HEDGEHOG_EVENT_MAX_RANGE_PCT = 3.0
+HEDGEHOG_EVENT_MIN_NEEDLES = 3
 
 # самая долгая история, которую вообще нужно хранить — под неё считается retention в _update_history
 HISTORY_RETENTION_SEC = max(IMPULSE_WINDOW_SEC, HEDGEHOG_WINDOW_SEC, HEDGEHOG_VOL_60M_SEC) + POLL_INTERVAL_SEC
@@ -493,14 +496,19 @@ class MarketScanner:
         window_prices = [price for ts, price, _vol in dq if ts >= window_cutoff]
         result = {
             "hh_ready": len(window_prices) >= HEDGEHOG_MIN_SAMPLES,
+            "hh_low": 0.0,
+            "hh_high": 0.0,
             "hh_range_pct": 0.0,
             "hh_touch_top": 0.0,
             "hh_touch_bot": 0.0,
+            "hh_needle_count": 0,
             "vol_60m": 0.0,
             "vol_10m": 0.0,
         }
         if window_prices:
             hi, lo = max(window_prices), min(window_prices)
+            result["hh_low"] = lo
+            result["hh_high"] = hi
             if lo:
                 result["hh_range_pct"] = (hi - lo) / lo * 100
             span = hi - lo
@@ -508,6 +516,21 @@ class MarketScanner:
                 tol = span * HEDGEHOG_TOUCH_TOLERANCE_PCT / 100
                 result["hh_touch_top"] = sum(1 for p in window_prices if p >= hi - tol) / len(window_prices)
                 result["hh_touch_bot"] = sum(1 for p in window_prices if p <= lo + tol) / len(window_prices)
+                last_zone = None
+                needle_count = 0
+                for price in window_prices:
+                    if price >= hi - tol:
+                        zone = "top"
+                    elif price <= lo + tol:
+                        zone = "bottom"
+                    else:
+                        zone = None
+                    if zone is None or zone == last_zone:
+                        continue
+                    if last_zone is not None:
+                        needle_count += 1
+                    last_zone = zone
+                result["hh_needle_count"] = needle_count
 
         # объём за 60м/10м — сумма положительных дельт кумулятивного 24ч
         # объёма между соседними замерами внутри окна. Приближение: 24ч-объём
@@ -717,3 +740,39 @@ class MarketScanner:
         точек истории) записи."""
         ready = [t for t in tickers if t.get("hh_ready")]
         return sorted(ready, key=lambda t: t["hh_range_pct"])[:n]
+
+    @staticmethod
+    def hedgehog_event_candidates(tickers, n=30, exchanges=HEDGEHOG_EVENT_EXCHANGES,
+                                  max_range_pct=HEDGEHOG_EVENT_MAX_RANGE_PCT,
+                                  min_needles=HEDGEHOG_EVENT_MIN_NEEDLES):
+        """Кандидаты для ленты событий "ершей": цена уже прогрета, держится в
+        узком диапазоне и несколько раз сходила от одной границы к другой.
+
+        Это не поиск пробоя. Здесь фиксируется само состояние "ходит туда-сюда"
+        внутри диапазона, чтобы GUI мог отдельно проверить стакан и дать
+        уведомление только по нужным биржам."""
+        allowed = set(exchanges or [])
+        out = []
+        for t in tickers:
+            if allowed and t.get("exchange") not in allowed:
+                continue
+            if not t.get("hh_ready"):
+                continue
+            range_pct = float(t.get("hh_range_pct", 0.0) or 0.0)
+            if range_pct <= 0 or range_pct > max_range_pct:
+                continue
+            if int(t.get("hh_needle_count", 0) or 0) < min_needles:
+                continue
+            if t.get("hh_low", 0.0) <= 0 or t.get("hh_high", 0.0) <= 0:
+                continue
+            out.append(t)
+
+        def score(t):
+            # Больше переходов внутри более узкого диапазона — интереснее.
+            return (
+                -int(t.get("hh_needle_count", 0) or 0),
+                float(t.get("hh_range_pct", 0.0) or 0.0),
+                -float(t.get("quote_volume", 0.0) or 0.0),
+            )
+
+        return sorted(out, key=score)[:n]

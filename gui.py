@@ -12,6 +12,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 
+import requests
+
 from audit_log import AuditCsvWriter
 from orderbook import OrderBook
 from debug_log import log as dlog
@@ -41,6 +43,8 @@ from market_scan import (
     IMPULSE_HIGHLIGHT_PCT as MARKET_IMPULSE_HIGHLIGHT_PCT,
     TOP_N as MARKET_TOP_N,
     HEDGEHOG_WINDOW_SEC,
+    HEDGEHOG_EVENT_MAX_RANGE_PCT,
+    HEDGEHOG_EVENT_MIN_NEEDLES,
     EARLY_RANGE_MIN_PCT,
     EARLY_RANGE_MAX_PCT,
     EARLY_VOL_MIN_USD,
@@ -88,6 +92,7 @@ TRADE_TAPE_EXCHANGES = {"BINANCE", "BINANCE SPOT"}
 ALL_EXCHANGES_LABEL = "🌐 ВСЕ БИРЖИ"  # спец-пункт в комбобоксе "Биржа" — добавить тикер сразу везде, где он есть
 MARKET_TOP_EXCHANGES = ["BINANCE", "ASTERDEX", "GATE", "OKX"]  # что ПОКАЗЫВАЕМ в "Топ движений"
 HEDGEHOG_EXCHANGES = ["BINANCE", "BYBIT", "BINANCE SPOT", "ASTERDEX SPOT", "GATE SPOT", "OKX SPOT"]
+HEDGEHOG_EVENT_EXCHANGES = {"BINANCE", "BYBIT"}
 # Что market_scanner РЕАЛЬНО опрашивает: набор "Топ движений" + MEXC (нужен
 # вкладке "Ранние") + BYBIT (нужен фильтру эксклюзивности "Ранних" — MAJOR_EXCHANGES).
 # "Топ движений" всё равно показывает только MARKET_TOP_EXCHANGES (фильтр в
@@ -191,6 +196,7 @@ ALERT_FILTERS = [
 BEEP_FREQ = {
     "APPEARED": 700, "MAGNET": 1000, "PUSH": 1100, "EATEN": 500, "PULLED": 350,
     "WALL": 1200, "WALL_GONE": 400, "CASCADE": 1500, "IMPULSE": 850,
+    "HEDGEHOG_NEEDLES": 1050, "HEDGEHOG_BOOK": 1350,
 }
 
 WALLS_PUSH_INTERVAL = 1.0
@@ -282,6 +288,25 @@ DEFAULT_PRINT_SIMILARITY_PCT = 15.0
 DEFAULT_PRINT_MIN_USD = 0.0
 DEFAULT_PRINT_MAX_USD = None
 MAX_PRINT_ROWS = 200
+HEDGEHOG_EVENT_SETTINGS_FILE = os.path.join(_APP_DIR, "hedgehog_event_settings.json")
+HEDGEHOG_EVENT_MAX_ROWS = 500
+HEDGEHOG_EVENT_DEPTH_LIMIT = 100
+HEDGEHOG_EVENT_DEPTH_CACHE_SEC = 45.0
+HEDGEHOG_EVENT_REALERT_SEC = 20 * 60
+HEDGEHOG_EVENT_BOOK_MIN_USD = 20_000.0
+HEDGEHOG_EVENT_RANGE_PAD_RATIO = 0.25
+HEDGEHOG_EVENT_FILTERS = [
+    ("HEDGEHOG_NEEDLES", "Иголки"),
+    ("HEDGEHOG_BOOK", "Стакан"),
+]
+HEDGEHOG_EVENT_LABELS = {
+    "HEDGEHOG_NEEDLES": "ИГОЛКИ",
+    "HEDGEHOG_BOOK": "СТАКАН",
+}
+HEDGEHOG_EVENT_COLORS = {
+    "HEDGEHOG_NEEDLES": EVENT_COLORS["PUSH"],
+    "HEDGEHOG_BOOK": EVENT_COLORS["WALL"],
+}
 
 # "Ранние" (вотч-лист живой тишины). Монета должна продержаться в профиле
 # EARLY_CONFIRM_TICKS сканов подряд, прежде чем дать алерт — иначе те, кто
@@ -388,6 +413,16 @@ class App:
         self.print_min_usd = DEFAULT_PRINT_MIN_USD
         self.print_max_usd = DEFAULT_PRINT_MAX_USD
         self._load_print_settings()
+        self.hedgehog_event_popup_enabled = tk.BooleanVar(value=True)
+        self.hedgehog_event_sound_enabled = tk.BooleanVar(value=True)
+        self._hedgehog_event_rows = []
+        self._hedgehog_event_row_kinds = {}
+        self._next_hedgehog_event_seq = 0
+        self._hedgehog_event_active = set()
+        self._hedgehog_event_last_alert = {}
+        self._hedgehog_depth_cache = {}
+        self._hedgehog_event_lock = threading.Lock()
+        self._load_hedgehog_event_settings()
 
         # "Импульс" (вкладка "Топ движений") — всплывающие уведомления,
         # видимые независимо от активной вкладки. Порог/окно настраиваются
@@ -459,10 +494,17 @@ class App:
         tab_scanner = tk.Frame(self.notebook, bg="#0a0a0d")
         tab_movers = tk.Frame(self.notebook, bg="#0a0a0d")
         tab_hedgehog = tk.Frame(self.notebook, bg="#0a0a0d")
+        tab_hedgehog_events = tk.Frame(self.notebook, bg="#0a0a0d")
         tab_early = tk.Frame(self.notebook, bg="#0a0a0d")
+        self.tab_scanner = tab_scanner
+        self.tab_movers = tab_movers
+        self.tab_hedgehog = tab_hedgehog
+        self.tab_hedgehog_events = tab_hedgehog_events
+        self.tab_early = tab_early
         self.notebook.add(tab_scanner, text="Сканер плотностей")
         self.notebook.add(tab_movers, text="Топ движений")
         self.notebook.add(tab_hedgehog, text="🦔 Ерши")
+        self.notebook.add(tab_hedgehog_events, text="События ершей")
         self.notebook.add(tab_early, text="🎯 Ранние")
 
         top = tk.Frame(tab_scanner, bg="#0a0a0d")
@@ -714,6 +756,7 @@ class App:
 
         self._build_movers_tab(tab_movers)
         self._build_hedgehog_tab(tab_hedgehog)
+        self._build_hedgehog_events_tab(tab_hedgehog_events)
         self._build_early_tab(tab_early)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(10, 0))
 
@@ -844,6 +887,64 @@ class App:
         scroll.pack(side="right", fill="y")
         self.hedgehog_tree.bind("<Double-1>", lambda e: self._copy_symbol_from_tree(self.hedgehog_tree, 1))
         self.hedgehog_tree.bind("<Button-3>", lambda e: self._copy_symbol_from_tree_event(self.hedgehog_tree, 1, e))
+
+    def _build_hedgehog_events_tab(self, parent):
+        hint = tk.Label(parent,
+                         text=f"Binance futures и Bybit. События появляются, когда цена ходит внутри "
+                              f"диапазона до {HEDGEHOG_EVENT_MAX_RANGE_PCT:g}% и есть минимум "
+                              f"{HEDGEHOG_EVENT_MIN_NEEDLES} перехода верх/низ. Пробой не ищем.",
+                         bg="#0a0a0d", fg="#6b7078", font=("Segoe UI", 9))
+        hint.pack(anchor="w", padx=4, pady=(8, 4))
+
+        bar = tk.Frame(parent, bg="#0a0a0d")
+        bar.pack(fill="x", padx=4, pady=(0, 4))
+        tk.Label(bar, text="Фильтр:", bg="#0a0a0d", fg="white",
+                 font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 8))
+        self.hedgehog_event_filter_vars = {}
+        for kind, label in HEDGEHOG_EVENT_FILTERS:
+            var = tk.BooleanVar(value=True)
+            self.hedgehog_event_filter_vars[kind] = var
+            tk.Checkbutton(bar, text=label, variable=var, command=self._apply_hedgehog_event_filters,
+                           bg="#0a0a0d", fg="#d1d5db", selectcolor="#131316",
+                           activebackground="#0a0a0d", activeforeground="white",
+                           font=("Segoe UI", 9)).pack(side="left", padx=(0, 10))
+        tk.Checkbutton(bar, text="Всплывающее окно", variable=self.hedgehog_event_popup_enabled,
+                       command=self._save_hedgehog_event_settings,
+                       bg="#0a0a0d", fg="white", selectcolor="#131316",
+                       activebackground="#0a0a0d", activeforeground="white").pack(side="left", padx=(12, 0))
+        tk.Checkbutton(bar, text="Звук", variable=self.hedgehog_event_sound_enabled,
+                       command=self._save_hedgehog_event_settings,
+                       bg="#0a0a0d", fg="white", selectcolor="#131316",
+                       activebackground="#0a0a0d", activeforeground="white").pack(side="left", padx=(12, 0))
+        tk.Button(bar, text="Очистить", command=self._clear_hedgehog_event_log,
+                  bg="#1f1f24", fg="white", relief="flat", padx=8).pack(side="right")
+
+        frame = tk.Frame(parent, bg="#0a0a0d")
+        frame.pack(fill="both", expand=True, padx=4, pady=(0, 8))
+
+        cols = ("time", "exchange", "symbol", "event", "last", "range",
+                "needles", "bounds", "book", "details")
+        headers = {"time": "Время", "exchange": "Биржа", "symbol": "Символ",
+                   "event": "Событие", "last": "Цена", "range": "Диапазон",
+                   "needles": "Иголок", "bounds": "Границы", "book": "Стакан",
+                   "details": "Детали"}
+        widths = {"time": 70, "exchange": 110, "symbol": 130, "event": 100,
+                  "last": 95, "range": 85, "needles": 70, "bounds": 170,
+                  "book": 190, "details": 260}
+        self.hedgehog_events_tree = ttk.Treeview(frame, columns=cols, show="headings")
+        for c in cols:
+            self.hedgehog_events_tree.heading(c, text=headers[c])
+            self.hedgehog_events_tree.column(c, width=widths[c], anchor="center" if c != "details" else "w")
+        for kind, color in HEDGEHOG_EVENT_COLORS.items():
+            self.hedgehog_events_tree.tag_configure(kind, foreground=color)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.hedgehog_events_tree.yview)
+        self.hedgehog_events_tree.configure(yscrollcommand=scroll.set)
+        self.hedgehog_events_tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.hedgehog_events_tree.bind("<Double-1>",
+                                       lambda e: self._copy_symbol_from_tree(self.hedgehog_events_tree, 2))
+        self.hedgehog_events_tree.bind("<Button-3>",
+                                       lambda e: self._copy_symbol_from_tree_event(self.hedgehog_events_tree, 2, e))
 
     def _build_early_tab(self, parent):
         """Вкладка «🎯 Ранние»: монеты MEXC в состоянии "живой тишины" — тот
@@ -1427,6 +1528,7 @@ class App:
             ("gainers_tree", 1),
             ("losers_tree", 1),
             ("hedgehog_tree", 1),
+            ("hedgehog_events_tree", 2),
         ):
             tree = getattr(self, attr, None)
             if tree is not None:
@@ -1811,6 +1913,12 @@ class App:
 
     def _on_hedgehog_update(self, tickers):
         self.event_queue.put(("HEDGEHOG", tickers))
+        try:
+            events = self._scan_hedgehog_events_background(tickers)
+            if events:
+                self.event_queue.put(("HEDGEHOG_EVENTS", events))
+        except Exception as e:
+            dlog(f"hedgehog event scan error: {e!r}")
 
     def _handle_status_for_conn(self, text):
         """Разбирает текст вида '[Binance] Подключено' и обновляет индикатор
@@ -1878,6 +1986,9 @@ class App:
                     self._update_movers_trees(item[1])
                 elif kind == "HEDGEHOG":
                     self._update_hedgehog_tree(item[1])
+                elif kind == "HEDGEHOG_EVENTS":
+                    for ev in item[1]:
+                        self._render_hedgehog_event(ev)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
@@ -2190,6 +2301,308 @@ class App:
         except Exception:
             pass
 
+    def _load_hedgehog_event_settings(self):
+        if not os.path.exists(HEDGEHOG_EVENT_SETTINGS_FILE):
+            return
+        try:
+            with open(HEDGEHOG_EVENT_SETTINGS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            self.hedgehog_event_popup_enabled.set(bool(data.get("popup_enabled", True)))
+            self.hedgehog_event_sound_enabled.set(bool(data.get("sound_enabled", True)))
+        except Exception:
+            pass
+
+    def _save_hedgehog_event_settings(self):
+        data = {
+            "popup_enabled": self.hedgehog_event_popup_enabled.get(),
+            "sound_enabled": self.hedgehog_event_sound_enabled.get(),
+        }
+        try:
+            with open(HEDGEHOG_EVENT_SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _passes_hedgehog_event_filter(self, kind):
+        var = getattr(self, "hedgehog_event_filter_vars", {}).get(kind)
+        return True if var is None else bool(var.get())
+
+    def _apply_hedgehog_event_filters(self):
+        if not hasattr(self, "hedgehog_events_tree"):
+            return
+        for row in list(self._hedgehog_event_rows):
+            if not self.hedgehog_events_tree.exists(row):
+                continue
+            kind = self._hedgehog_event_row_kinds.get(row)
+            if self._passes_hedgehog_event_filter(kind):
+                self.hedgehog_events_tree.move(row, "", 0)
+            else:
+                self.hedgehog_events_tree.detach(row)
+        visible = [row for row in reversed(self._hedgehog_event_rows)
+                   if self.hedgehog_events_tree.exists(row)
+                   and self._passes_hedgehog_event_filter(self._hedgehog_event_row_kinds.get(row))]
+        for index, row in enumerate(visible):
+            self.hedgehog_events_tree.move(row, "", index)
+
+    def _clear_hedgehog_event_log(self):
+        rows = list(self._hedgehog_event_rows) if self._hedgehog_event_rows else list(
+            self.hedgehog_events_tree.get_children())
+        if not rows:
+            self.status_var.set("Лента событий ершей уже пустая")
+            return
+        if not messagebox.askyesno("Очистить события ершей", f"Удалить {len(rows)} записей?"):
+            return
+        for row in rows:
+            if self.hedgehog_events_tree.exists(row):
+                self.hedgehog_events_tree.delete(row)
+        self._hedgehog_event_rows.clear()
+        self._hedgehog_event_row_kinds.clear()
+        self.status_var.set("Лента событий ершей очищена")
+
+    def _scan_hedgehog_events_background(self, tickers):
+        candidates = MarketScanner.hedgehog_event_candidates(tickers, n=24, exchanges=HEDGEHOG_EVENT_EXCHANGES)
+        checked = []
+        for ticker in candidates:
+            book = self._get_hedgehog_book_confirmation(ticker)
+            kind = "HEDGEHOG_BOOK" if book.get("confirmed") else "HEDGEHOG_NEEDLES"
+            checked.append((ticker, kind, book))
+
+        now = time.time()
+        active_now = set()
+        new_events = []
+        with self._hedgehog_event_lock:
+            for ticker, kind, book in checked:
+                key = f"{ticker['exchange']}:{ticker['symbol']}:{kind}"
+                active_now.add(key)
+                if key in self._hedgehog_event_active:
+                    continue
+                self._hedgehog_event_active.add(key)
+                new_events.append({
+                    "ts": now,
+                    "kind": kind,
+                    "exchange": ticker["exchange"],
+                    "symbol": ticker["symbol"],
+                    "last": float(ticker.get("last", 0.0) or 0.0),
+                    "range_pct": float(ticker.get("hh_range_pct", 0.0) or 0.0),
+                    "needles": int(ticker.get("hh_needle_count", 0) or 0),
+                    "low": float(ticker.get("hh_low", 0.0) or 0.0),
+                    "high": float(ticker.get("hh_high", 0.0) or 0.0),
+                    "touch_top": float(ticker.get("hh_touch_top", 0.0) or 0.0),
+                    "touch_bot": float(ticker.get("hh_touch_bot", 0.0) or 0.0),
+                    "book": book,
+                    "notify": kind == "HEDGEHOG_BOOK",
+                })
+
+            self._hedgehog_event_active.intersection_update(active_now)
+        return new_events
+
+    def _get_hedgehog_book_confirmation(self, ticker):
+        key = f"{ticker.get('exchange')}:{ticker.get('symbol')}"
+        now = time.time()
+        cached = self._hedgehog_depth_cache.get(key)
+        if cached and now - cached[0] <= HEDGEHOG_EVENT_DEPTH_CACHE_SEC:
+            return cached[1]
+        try:
+            result = self._fetch_hedgehog_book_confirmation(
+                ticker["exchange"], ticker["symbol"],
+                float(ticker.get("hh_low", 0.0) or 0.0),
+                float(ticker.get("hh_high", 0.0) or 0.0),
+            )
+        except Exception as e:
+            result = {
+                "confirmed": False,
+                "side": "",
+                "price": 0.0,
+                "usd": 0.0,
+                "text": "—",
+                "details": f"стакан не проверен: {e}",
+            }
+        self._hedgehog_depth_cache[key] = (now, result)
+        return result
+
+    def _fetch_hedgehog_book_confirmation(self, exchange, symbol, low, high):
+        if exchange == "BINANCE":
+            resp = requests.get(
+                "https://fapi.binance.com/fapi/v1/depth",
+                params={"symbol": symbol, "limit": HEDGEHOG_EVENT_DEPTH_LIMIT},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            bids, asks = data.get("bids", []), data.get("asks", [])
+        elif exchange == "BYBIT":
+            resp = requests.get(
+                "https://api.bybit.com/v5/market/orderbook",
+                params={"category": "linear", "symbol": symbol, "limit": HEDGEHOG_EVENT_DEPTH_LIMIT},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("retCode") != 0:
+                raise RuntimeError(f"Bybit retCode={data.get('retCode')} {data.get('retMsg')}")
+            result = data.get("result", {})
+            bids, asks = result.get("b", []), result.get("a", [])
+        else:
+            return {
+                "confirmed": False,
+                "side": "",
+                "price": 0.0,
+                "usd": 0.0,
+                "text": "—",
+                "details": "для этой биржи проверка стакана отключена",
+            }
+        return self._summarize_hedgehog_book(bids, asks, low, high)
+
+    def _summarize_hedgehog_book(self, bids, asks, low, high):
+        span = high - low
+        if low <= 0 or high <= 0 or span <= 0:
+            return {
+                "confirmed": False,
+                "side": "",
+                "price": 0.0,
+                "usd": 0.0,
+                "text": "—",
+                "details": "нет границ диапазона",
+            }
+
+        pad = span * HEDGEHOG_EVENT_RANGE_PAD_RATIO
+        bid_zone = (max(0.0, low - pad), low + span * 0.35)
+        ask_zone = (high - span * 0.35, high + pad)
+        best_any = None
+        best_zone = None
+
+        def remember(best, candidate):
+            if best is None or candidate["usd"] > best["usd"]:
+                return candidate
+            return best
+
+        for side, levels, zone in (("bid", bids, bid_zone), ("ask", asks, ask_zone)):
+            for raw in levels:
+                try:
+                    price = float(raw[0])
+                    qty = float(raw[1])
+                except (IndexError, TypeError, ValueError):
+                    continue
+                usd = price * qty
+                item = {"side": side, "price": price, "usd": usd}
+                best_any = remember(best_any, item)
+                if zone[0] <= price <= zone[1]:
+                    best_zone = remember(best_zone, item)
+
+        chosen = best_zone or best_any
+        if not chosen:
+            return {
+                "confirmed": False,
+                "side": "",
+                "price": 0.0,
+                "usd": 0.0,
+                "text": "—",
+                "details": "стакан пустой",
+            }
+        confirmed = bool(best_zone and best_zone["usd"] >= HEDGEHOG_EVENT_BOOK_MIN_USD)
+        side_text = "низ" if chosen["side"] == "bid" else "верх"
+        edge_text = "нижней" if chosen["side"] == "bid" else "верхней"
+        text = f"{side_text} {_format_compact_usd(chosen['usd'])} @ {chosen['price']:g}"
+        if confirmed:
+            details = f"стенка у {edge_text} границы диапазона"
+        elif best_zone:
+            details = f"у края есть уровень, но меньше {_format_compact_usd(HEDGEHOG_EVENT_BOOK_MIN_USD)}"
+        else:
+            details = "крупный уровень вне края диапазона"
+        return {
+            "confirmed": confirmed,
+            "side": chosen["side"],
+            "price": chosen["price"],
+            "usd": chosen["usd"],
+            "text": text,
+            "details": details,
+        }
+
+    def _render_hedgehog_event(self, ev):
+        if not hasattr(self, "hedgehog_events_tree"):
+            return
+        kind = ev.get("kind", "HEDGEHOG_NEEDLES")
+        ts = datetime.fromtimestamp(ev.get("ts", time.time())).strftime("%H:%M:%S")
+        book = ev.get("book") or {}
+        bounds = f"{ev.get('low', 0.0):g}–{ev.get('high', 0.0):g}"
+        details = (
+            f"верх {ev.get('touch_top', 0.0):.2f}, низ {ev.get('touch_bot', 0.0):.2f}; "
+            f"{book.get('details', '')}"
+        )
+        iid = f"hedgehog-event-{self._next_hedgehog_event_seq}"
+        self._next_hedgehog_event_seq += 1
+        values = (
+            ts,
+            ev.get("exchange", ""),
+            ev.get("symbol", ""),
+            HEDGEHOG_EVENT_LABELS.get(kind, kind),
+            f"{ev.get('last', 0.0):g}",
+            f"{ev.get('range_pct', 0.0):.2f}%",
+            ev.get("needles", 0),
+            bounds,
+            book.get("text", "—"),
+            details,
+        )
+        self.hedgehog_events_tree.insert("", 0, iid=iid, values=values, tags=(kind,))
+        self._hedgehog_event_rows.append(iid)
+        self._hedgehog_event_row_kinds[iid] = kind
+        if not self._passes_hedgehog_event_filter(kind):
+            self.hedgehog_events_tree.detach(iid)
+        while len(self._hedgehog_event_rows) > HEDGEHOG_EVENT_MAX_ROWS:
+            old = self._hedgehog_event_rows.pop(0)
+            self._hedgehog_event_row_kinds.pop(old, None)
+            if self.hedgehog_events_tree.exists(old):
+                self.hedgehog_events_tree.delete(old)
+
+        if ev.get("notify"):
+            self._fire_hedgehog_event_alert(ev)
+
+    def _fire_hedgehog_event_alert(self, ev):
+        key = f"{ev.get('exchange')}:{ev.get('symbol')}:{ev.get('kind')}"
+        now = ev.get("ts", time.time())
+        if now - self._hedgehog_event_last_alert.get(key, 0.0) < HEDGEHOG_EVENT_REALERT_SEC:
+            return
+        if not (self.hedgehog_event_popup_enabled.get() or self.hedgehog_event_sound_enabled.get()):
+            return
+        self._hedgehog_event_last_alert[key] = now
+        if self.hedgehog_event_popup_enabled.get():
+            self._show_hedgehog_event_toast(ev)
+        if self.hedgehog_event_sound_enabled.get():
+            threading.Thread(target=_play_beep, args=("HEDGEHOG_BOOK",), daemon=True).start()
+
+    def _show_hedgehog_event_toast(self, ev):
+        color = HEDGEHOG_EVENT_COLORS.get(ev.get("kind"), EVENT_COLORS["WALL"])
+        symbol = ev.get("symbol", "")
+        exchange = ev.get("exchange", "")
+        book = ev.get("book") or {}
+
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        toast.configure(bg=color)
+        inner = tk.Frame(toast, bg="#1f1f24")
+        inner.pack(fill="both", expand=True, padx=2, pady=2)
+        tk.Label(inner, text="Ерш + стакан", bg="#1f1f24", fg=color,
+                 font=("Segoe UI", 10, "bold"), anchor="w").pack(fill="x", padx=10, pady=(8, 0))
+        detail = f"{exchange}  {symbol}   {ev.get('range_pct', 0.0):.2f}%   {book.get('text', '')}"
+        tk.Label(inner, text=detail, bg="#1f1f24", fg="white",
+                 font=("Segoe UI", 9), anchor="w").pack(fill="x", padx=10, pady=(0, 8))
+
+        def _on_click(_event=None):
+            self.notebook.select(self.tab_hedgehog_events)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(symbol)
+            self.status_var.set(f"Событие ерша: {symbol} скопирован в буфер")
+            self._remove_impulse_toast(toast)
+
+        toast.bind("<Button-1>", _on_click)
+        for w in (inner, *inner.winfo_children()):
+            w.bind("<Button-1>", _on_click)
+
+        self._active_impulse_toasts.append(toast)
+        self._reposition_impulse_toasts()
+        toast.after(IMPULSE_TOAST_MS, lambda: self._remove_impulse_toast(toast))
+
     def _check_impulse_alerts(self, tickers):
         """Edge-триггер: алерт только на ПЕРЕСЕЧЕНИЕ порога, не на каждый тик
         поверх него — иначе один и тот же импульс спамил бы тост каждые 15с,
@@ -2264,7 +2677,7 @@ class App:
         self._reposition_impulse_toasts()
 
     def _go_to_movers_tab(self, key):
-        self.notebook.select(1)  # 0=Сканер плотностей, 1=Топ движений, 2=Ерши
+        self.notebook.select(self.tab_movers)
         exchange, symbol = key.split(":", 1)
         self.root.clipboard_clear()
         self.root.clipboard_append(symbol)
@@ -2295,7 +2708,7 @@ class App:
         self.root.clipboard_clear()
         self.root.clipboard_append(symbol)
         self.status_var.set(f"Добавлено в сканер (AUTO) и скопировано в буфер: {exchange}:{symbol}")
-        self.notebook.select(0)
+        self.notebook.select(self.tab_scanner)
 
     # ---------------- ранние кандидаты (живая тишина) ----------------
 
@@ -2394,7 +2807,7 @@ class App:
                  font=("Segoe UI", 9), anchor="w").pack(fill="x", padx=10, pady=(0, 8))
 
         def _on_click(_event=None):
-            self.notebook.select(3)  # вкладка "🎯 Ранние"
+            self.notebook.select(self.tab_early)
             self.root.clipboard_clear()
             self.root.clipboard_append(symbol)
             self.status_var.set(f"Ранний кандидат: {symbol} скопирован в буфер")

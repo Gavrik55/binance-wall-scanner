@@ -6,8 +6,11 @@ import tkinter as tk
 import gui as guimod
 
 guimod.CONFIG_FILE = os.path.join(tempfile.gettempdir(), "test_hedgehog_gui_config.json")
+guimod.HEDGEHOG_EVENT_SETTINGS_FILE = os.path.join(tempfile.gettempdir(), "test_hedgehog_event_settings.json")
 if os.path.exists(guimod.CONFIG_FILE):
     os.remove(guimod.CONFIG_FILE)
+if os.path.exists(guimod.HEDGEHOG_EVENT_SETTINGS_FILE):
+    os.remove(guimod.HEDGEHOG_EVENT_SETTINGS_FILE)
 
 root = tk.Tk()
 app = guimod.App(root)
@@ -31,6 +34,45 @@ print("rows:", rows)
 assert rows == ("BINANCE:TIGHTUSDT", "BYBIT:WIDEUSDT"), rows
 assert "BINANCE:WARMUPUSDT" not in rows, "непрогретые не должны показываться"
 print("values TIGHTUSDT:", app.hedgehog_tree.item("BINANCE:TIGHTUSDT", "values"))
+
+book = app._summarize_hedgehog_book(
+    bids=[["1.001", "25000"]],
+    asks=[["1.019", "5000"]],
+    low=1.0,
+    high=1.02,
+)
+print("book confirmation:", book)
+assert book["confirmed"] is True
+assert "низ" in book["text"]
+
+event = {
+    "ts": 1_700_000_000.0,
+    "kind": "HEDGEHOG_BOOK",
+    "exchange": "BINANCE",
+    "symbol": "TIGHTUSDT",
+    "last": 1.01,
+    "range_pct": 2.0,
+    "needles": 5,
+    "low": 1.0,
+    "high": 1.02,
+    "touch_top": 0.4,
+    "touch_bot": 0.5,
+    "book": book,
+    "notify": False,
+}
+app._render_hedgehog_event(event)
+event_rows = app.hedgehog_events_tree.get_children()
+print("hedgehog event rows:", event_rows)
+assert len(event_rows) == 1
+values = app.hedgehog_events_tree.item(event_rows[0], "values")
+assert values[1:4] == ("BINANCE", "TIGHTUSDT", "СТАКАН"), values
+app.hedgehog_event_filter_vars["HEDGEHOG_BOOK"].set(False)
+app._apply_hedgehog_event_filters()
+assert app.hedgehog_events_tree.get_children() == ()
+app.hedgehog_event_filter_vars["HEDGEHOG_BOOK"].set(True)
+app._apply_hedgehog_event_filters()
+assert len(app.hedgehog_events_tree.get_children()) == 1
+print("OK: новая лента событий ершей отрисовывается и фильтруется")
 
 root.destroy()
 print("ALL HEDGEHOG GUI TESTS PASSED")

@@ -161,6 +161,28 @@ app._copy_symbol_from_tree(app.hedgehog_tree, 1)
 assert clip() == "HHUSDT", f"получено {clip()!r}"
 print("OK: 'Ерши' копирует тикер по двойному клику")
 
+# --- 5b) события ершей ---
+app._render_hedgehog_event({
+    "ts": 1_700_000_000.0,
+    "kind": "HEDGEHOG_NEEDLES",
+    "exchange": "BINANCE",
+    "symbol": "HHEVENTUSDT",
+    "last": 1.01,
+    "range_pct": 1.7,
+    "needles": 4,
+    "low": 1.0,
+    "high": 1.017,
+    "touch_top": 0.4,
+    "touch_bot": 0.4,
+    "book": {"text": "—", "details": "тест"},
+    "notify": False,
+})
+hh_event_row = app.hedgehog_events_tree.get_children()[0]
+app.hedgehog_events_tree.selection_set(hh_event_row)
+app._copy_symbol_from_tree(app.hedgehog_events_tree, 2)
+assert clip() == "HHEVENTUSDT", f"получено {clip()!r}"
+print("OK: 'События ершей' копирует тикер по двойному клику")
+
 # --- 6) удаление нескольких монет через Delete/общий обработчик ---
 app._add_symbol("DELONEUSDT", 1000, "LONG", exchange="BINANCE", mode="FIXED",
                 silent=True, exact_exchange=True)

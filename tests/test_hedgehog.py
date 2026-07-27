@@ -31,7 +31,8 @@ assert exchanges_seen == {"BINANCE", "BYBIT"}, "не должно быть ни�
 
 sample = last_batch[0]
 print("пример тикера:", sample)
-for key in ("impulse_pct", "hh_ready", "hh_range_pct", "hh_touch_top", "hh_touch_bot", "vol_60m", "vol_10m"):
+for key in ("impulse_pct", "hh_ready", "hh_low", "hh_high", "hh_range_pct",
+            "hh_touch_top", "hh_touch_bot", "hh_needle_count", "vol_60m", "vol_10m"):
     assert key in sample, f"нет поля {key}"
 print("OK: все hedgehog-поля присутствуют")
 
