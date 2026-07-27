@@ -5,6 +5,7 @@ os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tkinter as tk
 import gui as guimod
 
+guimod.HEDGEHOG_BOOTSTRAP_ENABLED = False
 guimod.CONFIG_FILE = os.path.join(tempfile.gettempdir(), "test_clipboard_config.json")
 if os.path.exists(guimod.CONFIG_FILE):
     os.remove(guimod.CONFIG_FILE)

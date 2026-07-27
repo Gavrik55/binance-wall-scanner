@@ -22,19 +22,19 @@ REST-эндпоинт, отдающий тикеры сразу по всему 
 POLL_INTERVAL_SEC), в отличие от сканера плотностей, где именно REST-снапшоты
 по каждому символу были источником шторма/429 (см. ws_manager.py, gui.py).
 
-"Ёрш"/"лесенка" (см. HEDGEHOG_*) считается из той же самой скользящей истории
-цены, что и импульс — просто окно длиннее (HEDGEHOG_WINDOW_SEC). Отдельных
-REST-запросов под это не заводим: диапазон/объём/касания границ — производные
-величины от уже опрашиваемых раз в POLL_INTERVAL_SEC тикеров. За счёт этого
-частота выборки (раз в 15 сек) грубее, чем у специализированных ботов на
-1-минутных свечах — метрики приблизительные, но кандидатов на неликвиде
-находят без единого лишнего запроса к биржам.
+"Ёрш"/"лесенка" (см. HEDGEHOG_*) считается из скользящей истории цены, что и
+импульс — просто окно длиннее (HEDGEHOG_WINDOW_SEC). Живой поток обновляется
+по тикерам раз в POLL_INTERVAL_SEC, а для вкладки "События ершей" при старте
+дополнительно подгружается история Binance futures/Bybit минутными свечами:
+так не надо ждать первые часы после запуска. Стаканную историю биржи задним
+числом не отдают, поэтому подтверждение стаканом всегда проверяется по
+текущему стакану.
 """
 
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -43,7 +43,7 @@ IMPULSE_WINDOW_SEC = 180.0   # 3 минуты — окно для расчёта
 IMPULSE_HIGHLIGHT_PCT = 2.0  # |impulse_pct| от этого значения — подсвечиваем в UI как "⚡"
 TOP_N = 20
 
-HEDGEHOG_WINDOW_SEC = 60 * 90       # 90 минут — окно для диапазона/касаний "ерша"
+HEDGEHOG_WINDOW_SEC = 60 * 120      # 2 часа — окно для диапазона/касаний "ерша"
 HEDGEHOG_MIN_SAMPLES = 30           # минимум точек в окне, чтобы вообще считать метрику (прогрев)
 HEDGEHOG_TOUCH_TOLERANCE_PCT = 15.0 # "касанием" границы диапазона считаем попадание в ближайшие N% от его ширины
 HEDGEHOG_VOL_60M_SEC = 60 * 60
@@ -51,6 +51,11 @@ HEDGEHOG_VOL_10M_SEC = 10 * 60
 HEDGEHOG_EVENT_EXCHANGES = ("BINANCE", "BYBIT")
 HEDGEHOG_EVENT_MAX_RANGE_PCT = 3.0
 HEDGEHOG_EVENT_MIN_NEEDLES = 3
+HEDGEHOG_BOOTSTRAP_HOURS = 2.0
+HEDGEHOG_BOOTSTRAP_WORKERS = 4
+HEDGEHOG_BOOTSTRAP_PROGRESS_EVERY = 25
+BINANCE_FUTURES_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+BYBIT_KLINES_URL = "https://api.bybit.com/v5/market/kline"
 
 # самая долгая история, которую вообще нужно хранить — под неё считается retention в _update_history
 HISTORY_RETENTION_SEC = max(IMPULSE_WINDOW_SEC, HEDGEHOG_WINDOW_SEC, HEDGEHOG_VOL_60M_SEC) + POLL_INTERVAL_SEC
@@ -287,6 +292,92 @@ def _fetch_bybit() -> list:
     return out
 
 
+def fetch_hedgehog_klines(exchange, symbol, limit):
+    """Минутные свечи для быстрой подгрузки истории ершей.
+
+    Возвращает список:
+    (open_ts_sec, open, high, low, close, quote_volume_for_minute)
+    """
+    limit = max(1, min(1500, int(limit)))
+    if exchange == "BINANCE":
+        resp = requests.get(
+            BINANCE_FUTURES_KLINES_URL,
+            params={"symbol": symbol, "interval": "1m", "limit": limit},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        out = []
+        for c in resp.json():
+            try:
+                out.append((
+                    int(c[0]) / 1000.0,
+                    float(c[1]),
+                    float(c[2]),
+                    float(c[3]),
+                    float(c[4]),
+                    float(c[7]),
+                ))
+            except (IndexError, TypeError, ValueError):
+                continue
+        return out
+
+    if exchange == "BYBIT":
+        resp = requests.get(
+            BYBIT_KLINES_URL,
+            params={"category": "linear", "symbol": symbol, "interval": "1", "limit": limit},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("retCode") != 0:
+            raise RuntimeError(f"Bybit retCode={data.get('retCode')} {data.get('retMsg')}")
+        out = []
+        for c in data.get("result", {}).get("list", []):
+            try:
+                out.append((
+                    int(c[0]) / 1000.0,
+                    float(c[1]),
+                    float(c[2]),
+                    float(c[3]),
+                    float(c[4]),
+                    float(c[6]),
+                ))
+            except (IndexError, TypeError, ValueError):
+                continue
+        return sorted(out, key=lambda x: x[0])
+
+    raise ValueError(f"hedgehog kline bootstrap is not supported for {exchange}")
+
+
+def _history_entries_from_klines(candles, cumulative_quote_volume_end):
+    """Превращает 1m OHLCV в точки истории цены.
+
+    Биржа не говорит, что внутри минуты было раньше — high или low. Поэтому
+    используем простую эвристику: в зелёной свече low -> high, в красной
+    high -> low. Это приближение, но оно позволяет не потерять фитили, которые
+    важны для вкладки "События ершей".
+    """
+    total_volume = sum(max(0.0, float(c[5] or 0.0)) for c in candles)
+    base_volume = max(0.0, float(cumulative_quote_volume_end or 0.0) - total_volume)
+    running_volume = 0.0
+    entries = []
+    for ts, open_p, high_p, low_p, close_p, quote_volume in candles:
+        quote_volume = max(0.0, float(quote_volume or 0.0))
+        before_volume = base_volume + running_volume
+        running_volume += quote_volume
+        after_volume = base_volume + running_volume
+        if close_p >= open_p:
+            middle = ((ts + 20, low_p), (ts + 40, high_p))
+        else:
+            middle = ((ts + 20, high_p), (ts + 40, low_p))
+        points = [(ts + 5, open_p), *middle, (ts + 59, close_p)]
+        for point_ts, price in points:
+            if price > 0:
+                volume = after_volume if point_ts >= ts + 59 else before_volume
+                entries.append((point_ts, price, volume))
+    return entries
+
+
 def fetch_binance_spot_symbols() -> set:
     """Все USDT-пары со СПОТА Binance (нормализованные, вида "BTCUSDT").
     Используется только для проверки "эксклюзивности" листинга, не для цен."""
@@ -373,7 +464,7 @@ class MarketScanner:
         self._lock = threading.Lock()
         # изменяемое поле (не модульная константа) — GUI может перенастроить
         # окно импульса в рантайме без пересоздания сканера. HISTORY_RETENTION_SEC
-        # уже с большим запасом (задаётся окном "ершей", 90 мин) — под любое
+        # уже с большим запасом (задаётся окном "ершей", 2 часа) — под любое
         # разумное окно импульса истории хватит без досчёта retention.
         self.impulse_window_sec = IMPULSE_WINDOW_SEC
         # заполняется в bootstrap_mexc_history; пустое множество безопасно —
@@ -495,6 +586,7 @@ class MarketScanner:
         window_cutoff = now - HEDGEHOG_WINDOW_SEC
         window_prices = [price for ts, price, _vol in dq if ts >= window_cutoff]
         result = {
+            "hh_samples": len(window_prices),
             "hh_ready": len(window_prices) >= HEDGEHOG_MIN_SAMPLES,
             "hh_low": 0.0,
             "hh_high": 0.0,
@@ -584,6 +676,89 @@ class MarketScanner:
             result["vol_accel"] = (vol_10m / 10.0) / (prior_50m / 50.0)
         result["early_ready"] = True
         return result
+
+    def bootstrap_hedgehog_history(self, exchanges=HEDGEHOG_EVENT_EXCHANGES,
+                                   hours=HEDGEHOG_BOOTSTRAP_HOURS,
+                                   on_progress=None, on_done=None):
+        """Подгрузить минутные свечи для вкладки "События ершей".
+
+        Это ускоряет старт: вместо ожидания 30 живых 15-секундных опросов
+        программа почти сразу получает ценовую историю за последние часы.
+        Историю стакана биржи задним числом не отдают, поэтому стаканное
+        подтверждение всё равно проверяется текущим REST-стаканом при событии.
+        """
+        limit = max(1, int(hours * 60))
+
+        def progress(**kwargs):
+            if on_progress:
+                on_progress(kwargs)
+
+        targets = []
+        progress(state="loading_tickers", done=0, total=0, seeded=0, errors=0, hours=hours)
+        for exchange in exchanges:
+            fetch = FETCHERS.get(exchange)
+            if not fetch:
+                continue
+            try:
+                tickers = fetch()
+            except Exception as e:
+                progress(state="ticker_error", exchange=exchange, done=0, total=0,
+                         seeded=0, errors=1, hours=hours, error=str(e))
+                continue
+            for ticker in tickers:
+                symbol = ticker.get("symbol")
+                if symbol:
+                    targets.append((exchange, symbol, float(ticker.get("quote_volume", 0.0) or 0.0)))
+
+        total = len(targets)
+        if not total:
+            progress(state="done", done=0, total=0, seeded=0, errors=0, hours=hours)
+            if on_done:
+                on_done(0)
+            return
+
+        progress(state="loading_history", done=0, total=total, seeded=0, errors=0, hours=hours)
+
+        def seed(target):
+            exchange, symbol, quote_volume = target
+            candles = fetch_hedgehog_klines(exchange, symbol, limit)
+            entries = _history_entries_from_klines(candles, quote_volume)
+            return exchange, symbol, entries
+
+        done = seeded = errors = 0
+        with ThreadPoolExecutor(max_workers=HEDGEHOG_BOOTSTRAP_WORKERS) as pool:
+            futures = [pool.submit(seed, target) for target in targets]
+            for future in as_completed(futures):
+                if self._stop:
+                    break
+                done += 1
+                try:
+                    result = future.result()
+                except Exception:
+                    errors += 1
+                    result = None
+                if result:
+                    exchange, symbol, entries = result
+                    if entries:
+                        key = f"{exchange}:{symbol}"
+                        with self._lock:
+                            existing = self._history.get(key, deque())
+                            oldest_live = existing[0][0] if existing else float("inf")
+                            merged = deque(e for e in entries if e[0] < oldest_live)
+                            merged.extend(existing)
+                            now = time.time()
+                            while merged and now - merged[0][0] > HISTORY_RETENTION_SEC:
+                                merged.popleft()
+                            self._history[key] = merged
+                        seeded += 1
+                if done == 1 or done == total or done % HEDGEHOG_BOOTSTRAP_PROGRESS_EVERY == 0:
+                    progress(state="loading_history", done=done, total=total,
+                             seeded=seeded, errors=errors, hours=hours)
+
+        progress(state="done", done=done, total=total, seeded=seeded, errors=errors, hours=hours)
+        self.on_status(f"[События ершей] история {hours:g}ч: готово {seeded}/{total}, ошибок {errors}")
+        if on_done:
+            on_done(seeded)
 
     def bootstrap_mexc_history(self, on_done=None):
         """Заполнить историю MEXC минутными свечами за последний час.

@@ -43,6 +43,8 @@ from market_scan import (
     IMPULSE_HIGHLIGHT_PCT as MARKET_IMPULSE_HIGHLIGHT_PCT,
     TOP_N as MARKET_TOP_N,
     HEDGEHOG_WINDOW_SEC,
+    HEDGEHOG_MIN_SAMPLES,
+    HEDGEHOG_BOOTSTRAP_HOURS,
     HEDGEHOG_EVENT_MAX_RANGE_PCT,
     HEDGEHOG_EVENT_MIN_NEEDLES,
     EARLY_RANGE_MIN_PCT,
@@ -93,6 +95,7 @@ ALL_EXCHANGES_LABEL = "🌐 ВСЕ БИРЖИ"  # спец-пункт в ком�
 MARKET_TOP_EXCHANGES = ["BINANCE", "ASTERDEX", "GATE", "OKX"]  # что ПОКАЗЫВАЕМ в "Топ движений"
 HEDGEHOG_EXCHANGES = ["BINANCE", "BYBIT", "BINANCE SPOT", "ASTERDEX SPOT", "GATE SPOT", "OKX SPOT"]
 HEDGEHOG_EVENT_EXCHANGES = {"BINANCE", "BYBIT"}
+HEDGEHOG_BOOTSTRAP_ENABLED = True
 # Что market_scanner РЕАЛЬНО опрашивает: набор "Топ движений" + MEXC (нужен
 # вкладке "Ранние") + BYBIT (нужен фильтру эксклюзивности "Ранних" — MAJOR_EXCHANGES).
 # "Топ движений" всё равно показывает только MARKET_TOP_EXCHANGES (фильтр в
@@ -277,7 +280,7 @@ def _normalize_symbol_input(symbol, exchange=None):
 IMPULSE_THRESHOLD_MIN_PCT = 0.1
 IMPULSE_THRESHOLD_MAX_PCT = 50.0
 IMPULSE_WINDOW_MIN_SEC = 30.0
-IMPULSE_WINDOW_MAX_SEC = 1800.0  # 30 мин — с запасом ниже HISTORY_RETENTION_SEC в market_scan.py (90 мин)
+IMPULSE_WINDOW_MAX_SEC = 1800.0  # 30 мин — с запасом ниже HISTORY_RETENTION_SEC в market_scan.py (2 часа)
 IMPULSE_TOAST_MS = 8000          # сколько всплывающее окно висит перед авто-закрытием
 IMPULSE_TOAST_W, IMPULSE_TOAST_H = 280, 58
 IMPULSE_SETTINGS_FILE = os.path.join(_APP_DIR, "impulse_settings.json")  # отдельный файл — config.json это список монет, а не dict настроек
@@ -422,6 +425,8 @@ class App:
         self._hedgehog_event_last_alert = {}
         self._hedgehog_depth_cache = {}
         self._hedgehog_event_lock = threading.Lock()
+        self._hedgehog_event_scan_stats = {}
+        self._hedgehog_bootstrap_stats = {}
         self._load_hedgehog_event_settings()
 
         # "Импульс" (вкладка "Топ движений") — всплывающие уведомления,
@@ -465,6 +470,14 @@ class App:
         self.hedgehog_scanner = MarketScanner(self._on_hedgehog_update, self._on_status,
                                                exchanges=HEDGEHOG_EXCHANGES)
         self.hedgehog_scanner.start()
+        if HEDGEHOG_BOOTSTRAP_ENABLED:
+            threading.Thread(target=self.hedgehog_scanner.bootstrap_hedgehog_history,
+                             kwargs={
+                                 "exchanges": tuple(HEDGEHOG_EVENT_EXCHANGES),
+                                 "hours": HEDGEHOG_BOOTSTRAP_HOURS,
+                                 "on_progress": self._on_hedgehog_bootstrap_progress,
+                             },
+                             daemon=True).start()
 
         # запись стаканов по вотч-листу — единственный способ получить историю
         # стакана перед пампом, её нельзя добрать задним числом (см. depth_recorder.py)
@@ -858,8 +871,8 @@ class App:
         """Вкладка «Ерши»: узкий боковой диапазон + частые касания обеих
         границ на низком объёме — типичный паттерн на неликвидных монетах
         перед резким движением. Считается
-        из той же скользящей истории тикеров, что и «Топ движений» — никаких
-        дополнительных REST-запросов, только окно шире (90 мин вместо 3)."""
+        из той же скользящей истории тикеров, что и «Топ движений» — окно
+        шире (2 часа вместо 3 минут)."""
         hint = tk.Label(parent,
                          text=f"Диапазон/касания за последние {int(HEDGEHOG_WINDOW_SEC / 60)} мин, "
                               f"Binance/Bybit + spot-рынки. Чем уже диапазон — тем выше в списке. "
@@ -918,6 +931,11 @@ class App:
                        activebackground="#0a0a0d", activeforeground="white").pack(side="left", padx=(12, 0))
         tk.Button(bar, text="Очистить", command=self._clear_hedgehog_event_log,
                   bg="#1f1f24", fg="white", relief="flat", padx=8).pack(side="right")
+
+        self.hedgehog_event_status_var = tk.StringVar(value="прогрев: ждём первые данные...")
+        tk.Label(parent, textvariable=self.hedgehog_event_status_var,
+                 bg="#0a0a0d", fg="#6b7078", font=("Segoe UI", 9),
+                 anchor="w").pack(fill="x", padx=4, pady=(0, 4))
 
         frame = tk.Frame(parent, bg="#0a0a0d")
         frame.pack(fill="both", expand=True, padx=4, pady=(0, 8))
@@ -1914,11 +1932,15 @@ class App:
     def _on_hedgehog_update(self, tickers):
         self.event_queue.put(("HEDGEHOG", tickers))
         try:
-            events = self._scan_hedgehog_events_background(tickers)
+            events, stats = self._scan_hedgehog_events_background(tickers)
+            self.event_queue.put(("HEDGEHOG_EVENT_STATS", stats))
             if events:
                 self.event_queue.put(("HEDGEHOG_EVENTS", events))
         except Exception as e:
             dlog(f"hedgehog event scan error: {e!r}")
+
+    def _on_hedgehog_bootstrap_progress(self, stats):
+        self.event_queue.put(("HEDGEHOG_BOOTSTRAP", stats))
 
     def _handle_status_for_conn(self, text):
         """Разбирает текст вида '[Binance] Подключено' и обновляет индикатор
@@ -1986,6 +2008,12 @@ class App:
                     self._update_movers_trees(item[1])
                 elif kind == "HEDGEHOG":
                     self._update_hedgehog_tree(item[1])
+                elif kind == "HEDGEHOG_EVENT_STATS":
+                    self._hedgehog_event_scan_stats = item[1]
+                    self._update_hedgehog_event_status()
+                elif kind == "HEDGEHOG_BOOTSTRAP":
+                    self._hedgehog_bootstrap_stats = item[1]
+                    self._update_hedgehog_event_status()
                 elif kind == "HEDGEHOG_EVENTS":
                     for ev in item[1]:
                         self._render_hedgehog_event(ev)
@@ -2367,6 +2395,7 @@ class App:
             kind = "HEDGEHOG_BOOK" if book.get("confirmed") else "HEDGEHOG_NEEDLES"
             checked.append((ticker, kind, book))
 
+        stats = self._make_hedgehog_event_scan_stats(tickers, checked)
         now = time.time()
         active_now = set()
         new_events = []
@@ -2394,7 +2423,72 @@ class App:
                 })
 
             self._hedgehog_event_active.intersection_update(active_now)
-        return new_events
+        return new_events, stats
+
+    def _make_hedgehog_event_scan_stats(self, tickers, checked):
+        relevant = [t for t in tickers if t.get("exchange") in HEDGEHOG_EVENT_EXCHANGES]
+        ready = [t for t in relevant if t.get("hh_ready")]
+        max_samples = max((int(t.get("hh_samples", 0) or 0) for t in relevant), default=0)
+        range_candidates = [
+            t for t in ready
+            if t.get("hh_low", 0.0) > 0
+            and t.get("hh_high", 0.0) > 0
+            and 0 < float(t.get("hh_range_pct", 0.0) or 0.0) <= HEDGEHOG_EVENT_MAX_RANGE_PCT
+        ]
+        needle_candidates = [
+            t for t in range_candidates
+            if int(t.get("hh_needle_count", 0) or 0) >= HEDGEHOG_EVENT_MIN_NEEDLES
+        ]
+        book_confirmed = sum(1 for _ticker, kind, _book in checked if kind == "HEDGEHOG_BOOK")
+        return {
+            "relevant": len(relevant),
+            "ready": len(ready),
+            "max_samples": max_samples,
+            "range_candidates": len(range_candidates),
+            "needle_candidates": len(needle_candidates),
+            "book_confirmed": book_confirmed,
+            "ts": time.time(),
+        }
+
+    def _update_hedgehog_event_status(self):
+        if not hasattr(self, "hedgehog_event_status_var"):
+            return
+        scan = self._hedgehog_event_scan_stats or {}
+        bootstrap = self._hedgehog_bootstrap_stats or {}
+
+        max_samples = int(scan.get("max_samples", 0) or 0)
+        relevant = int(scan.get("relevant", 0) or 0)
+        ready = int(scan.get("ready", 0) or 0)
+        if relevant and ready >= relevant:
+            warmup = f"прогрето {ready}/{relevant}"
+        else:
+            warmup = f"прогрев {min(max_samples, HEDGEHOG_MIN_SAMPLES)}/{HEDGEHOG_MIN_SAMPLES}"
+
+        parts = [
+            warmup,
+            f"кандидатов: {int(scan.get('range_candidates', 0) or 0)}",
+            f"после фильтра иголок: {int(scan.get('needle_candidates', 0) or 0)}",
+            f"со стаканом: {int(scan.get('book_confirmed', 0) or 0)}",
+        ]
+
+        state = bootstrap.get("state")
+        if state in {"loading_tickers", "loading_history"}:
+            done = int(bootstrap.get("done", 0) or 0)
+            total = int(bootstrap.get("total", 0) or 0)
+            seeded = int(bootstrap.get("seeded", 0) or 0)
+            errors = int(bootstrap.get("errors", 0) or 0)
+            if total:
+                parts.append(f"история {HEDGEHOG_BOOTSTRAP_HOURS:g}ч: {done}/{total}, готово {seeded}, ошибок {errors}")
+            else:
+                parts.append(f"история {HEDGEHOG_BOOTSTRAP_HOURS:g}ч: получаю список монет...")
+        elif state == "done":
+            seeded = int(bootstrap.get("seeded", 0) or 0)
+            total = int(bootstrap.get("total", 0) or 0)
+            errors = int(bootstrap.get("errors", 0) or 0)
+            if total:
+                parts.append(f"история {HEDGEHOG_BOOTSTRAP_HOURS:g}ч загружена: {seeded}/{total}, ошибок {errors}")
+
+        self.hedgehog_event_status_var.set(" | ".join(parts))
 
     def _get_hedgehog_book_confirmation(self, ticker):
         key = f"{ticker.get('exchange')}:{ticker.get('symbol')}"
