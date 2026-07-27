@@ -285,6 +285,7 @@ IMPULSE_TOAST_MS = 8000          # сколько всплывающее окн�
 IMPULSE_TOAST_W, IMPULSE_TOAST_H = 280, 58
 IMPULSE_SETTINGS_FILE = os.path.join(_APP_DIR, "impulse_settings.json")  # отдельный файл — config.json это список монет, а не dict настроек
 PRINT_SETTINGS_FILE = os.path.join(_APP_DIR, "print_settings.json")
+UI_SETTINGS_FILE = os.path.join(_APP_DIR, "ui_settings.json")
 REPEATING_PRINT_MIN_COUNT = 3
 DEFAULT_PRINT_WINDOW_SEC = 5.0
 DEFAULT_PRINT_SIMILARITY_PCT = 15.0
@@ -408,6 +409,7 @@ class App:
         self._symbol_suggestion_set = set()
         self._symbol_suggestion_lock = threading.Lock()
         self._symbol_suggestion_refreshing = False
+        self._ui_settings = self._load_ui_settings()
         self.audit_writer = AuditCsvWriter(_APP_DIR)
         self.audit_enabled = tk.BooleanVar(value=False)
         self.trade_tape = TradeTape()
@@ -449,6 +451,7 @@ class App:
         self._early_streak = {}     # symbol -> сколько сканов подряд держится в профиле
         self._early_alerted = {}    # symbol -> когда последний раз алертили (антиповтор)
         self.depth_recorder = DepthRecorder(EARLY_DEPTH_DIR, self._on_status)
+        self._apply_ui_settings_to_vars()
 
         self._build_ui()
         self.root.bind_all("<KeyPress>", self._on_global_keypress, add="+")
@@ -608,6 +611,7 @@ class App:
         self.start_btn.grid(row=0, column=3, padx=12)
 
         sound_chk = tk.Checkbutton(top2, text="🔔 Звук", variable=self.sound_enabled,
+                                    command=self._save_ui_settings,
                                     bg="#0a0a0d", fg="white", selectcolor="#131316",
                                     activebackground="#0a0a0d", activeforeground="white")
         sound_chk.grid(row=0, column=4, padx=4)
@@ -740,9 +744,9 @@ class App:
                  font=("Segoe UI", 11, "bold")).pack(side="left", anchor="w")
         self.alert_filter_vars = {}
         for kind, label in ALERT_FILTERS:
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(value=self._ui_filter_value("alert_filters", kind, True))
             self.alert_filter_vars[kind] = var
-            tk.Checkbutton(log_header, text=label, variable=var, command=self._apply_alert_filters,
+            tk.Checkbutton(log_header, text=label, variable=var, command=self._on_alert_filter_changed,
                            bg="#0a0a0d", fg="#d1d5db", selectcolor="#131316",
                            activebackground="#0a0a0d", activeforeground="white",
                            font=("Segoe UI", 8)).pack(side="left", padx=(8, 0))
@@ -817,9 +821,11 @@ class App:
         self.impulse_window_entry.grid(row=0, column=4, padx=(4, 12))
 
         tk.Checkbutton(settings, text="🔔 Всплывающее окно", variable=self.impulse_popup_enabled,
+                        command=self._on_impulse_checkbox_changed,
                         bg="#0a0a0d", fg="white", selectcolor="#131316",
                         activebackground="#0a0a0d", activeforeground="white").grid(row=0, column=5, padx=(0, 10))
         tk.Checkbutton(settings, text="🔊 Звук", variable=self.impulse_sound_enabled,
+                        command=self._on_impulse_checkbox_changed,
                         bg="#0a0a0d", fg="white", selectcolor="#131316",
                         activebackground="#0a0a0d", activeforeground="white").grid(row=0, column=6, padx=(0, 12))
 
@@ -915,18 +921,18 @@ class App:
                  font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 8))
         self.hedgehog_event_filter_vars = {}
         for kind, label in HEDGEHOG_EVENT_FILTERS:
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(value=self._ui_filter_value("hedgehog_event_filters", kind, True))
             self.hedgehog_event_filter_vars[kind] = var
-            tk.Checkbutton(bar, text=label, variable=var, command=self._apply_hedgehog_event_filters,
+            tk.Checkbutton(bar, text=label, variable=var, command=self._on_hedgehog_event_filter_changed,
                            bg="#0a0a0d", fg="#d1d5db", selectcolor="#131316",
                            activebackground="#0a0a0d", activeforeground="white",
                            font=("Segoe UI", 9)).pack(side="left", padx=(0, 10))
         tk.Checkbutton(bar, text="Всплывающее окно", variable=self.hedgehog_event_popup_enabled,
-                       command=self._save_hedgehog_event_settings,
+                       command=self._on_hedgehog_event_checkbox_changed,
                        bg="#0a0a0d", fg="white", selectcolor="#131316",
                        activebackground="#0a0a0d", activeforeground="white").pack(side="left", padx=(12, 0))
         tk.Checkbutton(bar, text="Звук", variable=self.hedgehog_event_sound_enabled,
-                       command=self._save_hedgehog_event_settings,
+                       command=self._on_hedgehog_event_checkbox_changed,
                        bg="#0a0a0d", fg="white", selectcolor="#131316",
                        activebackground="#0a0a0d", activeforeground="white").pack(side="left", padx=(12, 0))
         tk.Button(bar, text="Очистить", command=self._clear_hedgehog_event_log,
@@ -986,10 +992,12 @@ class App:
         bar = tk.Frame(parent, bg="#0a0a0d")
         bar.pack(fill="x", padx=4, pady=(0, 4))
         tk.Checkbutton(bar, text="🔔 Алерт при появлении новой монеты", variable=self.early_alerts_enabled,
+                        command=self._save_ui_settings,
                         bg="#0a0a0d", fg="white", selectcolor="#131316",
                         activebackground="#0a0a0d", activeforeground="white").pack(side="left")
         tk.Checkbutton(bar, text="🚫 Только эксклюзивы (без Binance/OKX/Bybit)",
                         variable=self.early_exclusive_only,
+                        command=self._save_ui_settings,
                         bg="#0a0a0d", fg="white", selectcolor="#131316",
                         activebackground="#0a0a0d", activeforeground="white").pack(side="left", padx=(12, 0))
         self.early_status_var = tk.StringVar(value="прогрев...")
@@ -1623,6 +1631,81 @@ class App:
         self._copy_symbol_from_tree(tree, symbol_index)
         return "break"
 
+    def _load_ui_settings(self):
+        if not os.path.exists(UI_SETTINGS_FILE):
+            return {}
+        try:
+            with open(UI_SETTINGS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _ui_filter_value(self, section, kind, default=True):
+        values = self._ui_settings.get(section, {})
+        if isinstance(values, dict) and kind in values:
+            return bool(values[kind])
+        return default
+
+    def _apply_ui_settings_to_vars(self):
+        values = self._ui_settings
+        if not isinstance(values, dict):
+            return
+        mapping = {
+            "sound_enabled": self.sound_enabled,
+            "impulse_popup_enabled": self.impulse_popup_enabled,
+            "impulse_sound_enabled": self.impulse_sound_enabled,
+            "hedgehog_event_popup_enabled": self.hedgehog_event_popup_enabled,
+            "hedgehog_event_sound_enabled": self.hedgehog_event_sound_enabled,
+            "early_alerts_enabled": self.early_alerts_enabled,
+            "early_exclusive_only": self.early_exclusive_only,
+        }
+        for key, var in mapping.items():
+            if key in values:
+                var.set(bool(values[key]))
+
+    def _save_ui_settings(self):
+        data = dict(self._ui_settings) if isinstance(self._ui_settings, dict) else {}
+        data.update({
+            "sound_enabled": bool(self.sound_enabled.get()),
+            "impulse_popup_enabled": bool(self.impulse_popup_enabled.get()),
+            "impulse_sound_enabled": bool(self.impulse_sound_enabled.get()),
+            "hedgehog_event_popup_enabled": bool(self.hedgehog_event_popup_enabled.get()),
+            "hedgehog_event_sound_enabled": bool(self.hedgehog_event_sound_enabled.get()),
+            "early_alerts_enabled": bool(self.early_alerts_enabled.get()),
+            "early_exclusive_only": bool(self.early_exclusive_only.get()),
+        })
+        if hasattr(self, "alert_filter_vars"):
+            data["alert_filters"] = {
+                kind: bool(var.get()) for kind, var in self.alert_filter_vars.items()
+            }
+        if hasattr(self, "hedgehog_event_filter_vars"):
+            data["hedgehog_event_filters"] = {
+                kind: bool(var.get()) for kind, var in self.hedgehog_event_filter_vars.items()
+            }
+        try:
+            with open(UI_SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            self._ui_settings = data
+        except Exception:
+            pass
+
+    def _on_alert_filter_changed(self):
+        self._apply_alert_filters()
+        self._save_ui_settings()
+
+    def _on_hedgehog_event_filter_changed(self):
+        self._apply_hedgehog_event_filters()
+        self._save_ui_settings()
+
+    def _on_impulse_checkbox_changed(self):
+        self._save_impulse_settings()
+        self._save_ui_settings()
+
+    def _on_hedgehog_event_checkbox_changed(self):
+        self._save_hedgehog_event_settings()
+        self._save_ui_settings()
+
     def _clear_alert_log(self):
         rows = list(self._alert_rows) if self._alert_rows else list(self.log.get_children())
         if not rows:
@@ -2225,6 +2308,7 @@ class App:
         self.losers_tree.heading("impulse", text=title)
         self._update_movers_hint()
         self._save_impulse_settings()
+        self._save_ui_settings()
         self.status_var.set(f"Импульс: порог {threshold:g}%, окно {int(window_sec)}с — применено")
 
     def _load_impulse_settings(self):
@@ -3053,4 +3137,6 @@ class App:
         self._save_config()
         self._save_impulse_settings()
         self._save_print_settings()
+        self._save_hedgehog_event_settings()
+        self._save_ui_settings()
         self.root.destroy()

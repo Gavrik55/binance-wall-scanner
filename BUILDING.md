@@ -46,6 +46,7 @@ $env:PATH = "$gitRoot\mingw64\bin;$gitRoot\cmd;$env:PATH"
 - `config.json`
 - `impulse_settings.json`
 - `print_settings.json`
+- `ui_settings.json`
 - `depth_data/`
 - `debug.log`
 - `debug_packs/`
