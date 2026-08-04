@@ -26,12 +26,16 @@ dist-versioned/
 config.json
 impulse_settings.json
 print_settings.json
+ui_settings.json
+hedgehog_event_settings.json
+spike_reversal_settings.json
 wall_scanner_config*.json
 
 # --- Recorded data and logs ---
 depth_data/
 debug_packs/
 audit_logs/
+tmm_cutter_data/
 debug.log
 *.log
 

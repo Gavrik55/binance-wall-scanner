@@ -54,11 +54,21 @@ HEDGEHOG_EVENT_MIN_NEEDLES = 3
 HEDGEHOG_BOOTSTRAP_HOURS = 2.0
 HEDGEHOG_BOOTSTRAP_WORKERS = 4
 HEDGEHOG_BOOTSTRAP_PROGRESS_EVERY = 25
+
+SPIKE_REVERSAL_EXCHANGES = ("BINANCE", "BYBIT")
+SPIKE_REVERSAL_HISTORY_SEC = 60 * 120
+SPIKE_REVERSAL_MIN_SAMPLES = 8
+SPIKE_REVERSAL_MIN_COUNT = 3
+SPIKE_REVERSAL_DEFAULT_RETURN_PCT = 70.0
+SPIKE_REVERSAL_DEFAULT_MIN_MOVE_PCT = 1.5
+SPIKE_REVERSAL_MAX_DURATION_SEC = 120.0
+SPIKE_REVERSAL_MIN_GAP_SEC = 30.0
 BINANCE_FUTURES_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 BYBIT_KLINES_URL = "https://api.bybit.com/v5/market/kline"
 
 # самая долгая история, которую вообще нужно хранить — под неё считается retention в _update_history
-HISTORY_RETENTION_SEC = max(IMPULSE_WINDOW_SEC, HEDGEHOG_WINDOW_SEC, HEDGEHOG_VOL_60M_SEC) + POLL_INTERVAL_SEC
+HISTORY_RETENTION_SEC = max(IMPULSE_WINDOW_SEC, HEDGEHOG_WINDOW_SEC, HEDGEHOG_VOL_60M_SEC,
+                            SPIKE_REVERSAL_HISTORY_SEC) + POLL_INTERVAL_SEC
 
 REST_URLS = {
     "BINANCE": "https://fapi.binance.com/fapi/v1/ticker/24hr",
@@ -195,6 +205,11 @@ def _fetch_gate_spot() -> list:
     return out
 
 
+def _okx_quote_volume(item, last, inst_type):
+    vol_ccy = float(item.get("volCcy24h", 0.0) or 0.0)
+    return vol_ccy * last if inst_type == "SWAP" else vol_ccy
+
+
 def _fetch_okx(inst_type="SWAP", exchange="OKX") -> list:
     resp = requests.get(REST_URLS["OKX"], params={"instType": inst_type}, timeout=10)
     resp.raise_for_status()
@@ -210,12 +225,15 @@ def _fetch_okx(inst_type="SWAP", exchange="OKX") -> list:
             open24h = float(item["open24h"])
             change_pct = ((last - open24h) / open24h * 100) if open24h else 0.0
             symbol = inst_id.replace("-SWAP", "").replace("-", "").upper()
+            # OKX SPOT returns volCcy24h in quote currency for USDT pairs, while
+            # OKX SWAP returns it in the base coin. Convert swaps to USDT.
+            quote_volume = _okx_quote_volume(item, last, inst_type)
             out.append({
                 "exchange": exchange,
                 "symbol": symbol,
                 "last": last,
                 "change_pct_24h": change_pct,
-                "quote_volume": float(item.get("volCcy24h", 0.0)),
+                "quote_volume": quote_volume,
             })
         except (KeyError, ValueError, TypeError):
             continue
@@ -467,6 +485,10 @@ class MarketScanner:
         # уже с большим запасом (задаётся окном "ершей", 2 часа) — под любое
         # разумное окно импульса истории хватит без досчёта retention.
         self.impulse_window_sec = IMPULSE_WINDOW_SEC
+        self.spike_reversal_history_sec = SPIKE_REVERSAL_HISTORY_SEC
+        self.spike_reversal_return_pct = SPIKE_REVERSAL_DEFAULT_RETURN_PCT
+        self.spike_reversal_min_move_pct = SPIKE_REVERSAL_DEFAULT_MIN_MOVE_PCT
+        self.spike_reversal_max_duration_sec = SPIKE_REVERSAL_MAX_DURATION_SEC
         # заполняется в bootstrap_mexc_history; пустое множество безопасно —
         # фильтр эксклюзивности просто не увидит спот-листинги Binance
         self.binance_spot_symbols = set()
@@ -517,6 +539,7 @@ class MarketScanner:
                     dq.popleft()
                 t["impulse_pct"] = self._impulse_pct(dq, now)
                 t.update(self._hedgehog_metrics(dq, now))
+                t.update(self._spike_reversal_metrics(dq, now))
                 t.update(self._early_metrics(dq, now, t))
                 if t["exchange"] == "MEXC SPOT":
                     t.update(self._oi_metrics(t["symbol"], now))
@@ -643,6 +666,152 @@ class MarketScanner:
                 prev_vol = vol
             result[out_key] = vol_sum
         return result
+
+    def _spike_reversal_metrics(self, dq, now):
+        """Find short spikes that return back into the prior area.
+
+        A "down" event is a quick drop followed by a buyback. An "up" event is a
+        quick pop followed by a sell-back. The GUI then requires at least three
+        such events on the same symbol before showing a candidate.
+        """
+        history_sec = max(60.0, min(SPIKE_REVERSAL_HISTORY_SEC,
+                                    float(getattr(self, "spike_reversal_history_sec",
+                                                  SPIKE_REVERSAL_HISTORY_SEC) or 0.0)))
+        min_return_pct = max(0.0, min(100.0, float(getattr(self, "spike_reversal_return_pct",
+                                                          SPIKE_REVERSAL_DEFAULT_RETURN_PCT) or 0.0)))
+        min_move_pct = max(0.0, float(getattr(self, "spike_reversal_min_move_pct",
+                                             SPIKE_REVERSAL_DEFAULT_MIN_MOVE_PCT) or 0.0))
+        max_duration_sec = max(15.0, min(300.0, float(getattr(self, "spike_reversal_max_duration_sec",
+                                                             SPIKE_REVERSAL_MAX_DURATION_SEC) or 0.0)))
+        cutoff = now - history_sec
+        window = [(ts, price) for ts, price, _vol in dq if ts >= cutoff and price > 0]
+        result = {
+            "rev_ready": len(window) >= SPIKE_REVERSAL_MIN_SAMPLES,
+            "rev_samples": len(window),
+            "rev_count": 0,
+            "rev_down_count": 0,
+            "rev_up_count": 0,
+            "rev_last_side": "",
+            "rev_last_ts": 0.0,
+            "rev_last_price": 0.0,
+            "rev_last_extreme": 0.0,
+            "rev_last_move_pct": 0.0,
+            "rev_last_return_pct": 0.0,
+            "rev_last_duration_sec": 0.0,
+            "rev_avg_move_pct": 0.0,
+            "rev_best_move_pct": 0.0,
+            "rev_avg_return_pct": 0.0,
+            "rev_events": [],
+        }
+        if not result["rev_ready"]:
+            return result
+
+        events = self._detect_spike_reversals(
+            window,
+            min_move_pct=min_move_pct,
+            min_return_pct=min_return_pct,
+            max_duration_sec=max_duration_sec,
+        )
+        if not events:
+            return result
+
+        down_count = sum(1 for ev in events if ev["side"] == "down")
+        up_count = sum(1 for ev in events if ev["side"] == "up")
+        last = max(events, key=lambda ev: ev["return_ts"])
+        result.update({
+            "rev_count": len(events),
+            "rev_down_count": down_count,
+            "rev_up_count": up_count,
+            "rev_last_side": last["side"],
+            "rev_last_ts": last["return_ts"],
+            "rev_last_price": last["return_price"],
+            "rev_last_extreme": last["extreme_price"],
+            "rev_last_move_pct": last["move_pct"],
+            "rev_last_return_pct": last["return_pct"],
+            "rev_last_duration_sec": last["duration_sec"],
+            "rev_avg_move_pct": sum(ev["move_pct"] for ev in events) / len(events),
+            "rev_best_move_pct": max(ev["move_pct"] for ev in events),
+            "rev_avg_return_pct": sum(ev["return_pct"] for ev in events) / len(events),
+            "rev_events": events[-20:],
+        })
+        return result
+
+    @staticmethod
+    def _detect_spike_reversals(points, min_move_pct=SPIKE_REVERSAL_DEFAULT_MIN_MOVE_PCT,
+                                min_return_pct=SPIKE_REVERSAL_DEFAULT_RETURN_PCT,
+                                max_duration_sec=SPIKE_REVERSAL_MAX_DURATION_SEC):
+        points = sorted((float(ts), float(price)) for ts, price in points if price > 0)
+        if len(points) < 3:
+            return []
+        min_move_pct = max(0.0, float(min_move_pct or 0.0))
+        return_ratio = max(0.0, min(1.0, float(min_return_pct or 0.0) / 100.0))
+        max_duration_sec = max(1.0, float(max_duration_sec or SPIKE_REVERSAL_MAX_DURATION_SEC))
+
+        raw = []
+        n = len(points)
+        for start_idx in range(n - 2):
+            start_ts, start_price = points[start_idx]
+            limit_ts = start_ts + max_duration_sec
+            end_idx = start_idx + 1
+            while end_idx < n and points[end_idx][0] <= limit_ts:
+                end_idx += 1
+            segment = points[start_idx + 1:end_idx]
+            if len(segment) < 2:
+                continue
+
+            low_rel, (low_ts, low_price) = min(enumerate(segment), key=lambda item: item[1][1])
+            if low_price < start_price:
+                move_pct = (start_price - low_price) / start_price * 100
+                if move_pct >= min_move_pct:
+                    target = low_price + (start_price - low_price) * return_ratio
+                    for return_ts, return_price in segment[low_rel + 1:]:
+                        if return_price >= target:
+                            returned = (return_price - low_price) / (start_price - low_price) * 100
+                            raw.append({
+                                "side": "down",
+                                "base_ts": start_ts,
+                                "base_price": start_price,
+                                "extreme_ts": low_ts,
+                                "extreme_price": low_price,
+                                "return_ts": return_ts,
+                                "return_price": return_price,
+                                "duration_sec": return_ts - start_ts,
+                                "move_pct": move_pct,
+                                "return_pct": min(999.0, returned),
+                            })
+                            break
+
+            high_rel, (high_ts, high_price) = max(enumerate(segment), key=lambda item: item[1][1])
+            if high_price > start_price:
+                move_pct = (high_price - start_price) / start_price * 100
+                if move_pct >= min_move_pct:
+                    target = high_price - (high_price - start_price) * return_ratio
+                    for return_ts, return_price in segment[high_rel + 1:]:
+                        if return_price <= target:
+                            returned = (high_price - return_price) / (high_price - start_price) * 100
+                            raw.append({
+                                "side": "up",
+                                "base_ts": start_ts,
+                                "base_price": start_price,
+                                "extreme_ts": high_ts,
+                                "extreme_price": high_price,
+                                "return_ts": return_ts,
+                                "return_price": return_price,
+                                "duration_sec": return_ts - start_ts,
+                                "move_pct": move_pct,
+                                "return_pct": min(999.0, returned),
+                            })
+                            break
+
+        raw.sort(key=lambda ev: ev["move_pct"], reverse=True)
+        chosen = []
+        min_gap = min(SPIKE_REVERSAL_MIN_GAP_SEC, max_duration_sec / 2.0)
+        for ev in raw:
+            if any(ev["side"] == prev["side"] and abs(ev["extreme_ts"] - prev["extreme_ts"]) <= min_gap
+                   for prev in chosen):
+                continue
+            chosen.append(ev)
+        return sorted(chosen, key=lambda ev: ev["return_ts"])
 
     def _early_metrics(self, dq, now, ticker):
         """Профиль "живой тишины" за EARLY_WINDOW_SEC. Считается из той же
@@ -948,6 +1117,32 @@ class MarketScanner:
                 -int(t.get("hh_needle_count", 0) or 0),
                 float(t.get("hh_range_pct", 0.0) or 0.0),
                 -float(t.get("quote_volume", 0.0) or 0.0),
+            )
+
+        return sorted(out, key=score)[:n]
+
+    @staticmethod
+    def spike_reversal_candidates(tickers, n=50, exchanges=SPIKE_REVERSAL_EXCHANGES,
+                                  min_count=SPIKE_REVERSAL_MIN_COUNT, sides=None):
+        allowed = set(exchanges or [])
+        allowed_sides = set(sides or ("down", "up"))
+        out = []
+        for t in tickers:
+            if allowed and t.get("exchange") not in allowed:
+                continue
+            if not t.get("rev_ready"):
+                continue
+            if int(t.get("rev_count", 0) or 0) < min_count:
+                continue
+            if t.get("rev_last_side") not in allowed_sides:
+                continue
+            out.append(t)
+
+        def score(t):
+            return (
+                -float(t.get("rev_last_ts", 0.0) or 0.0),
+                -int(t.get("rev_count", 0) or 0),
+                -float(t.get("rev_best_move_pct", 0.0) or 0.0),
             )
 
         return sorted(out, key=score)[:n]

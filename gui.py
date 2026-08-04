@@ -47,6 +47,12 @@ from market_scan import (
     HEDGEHOG_BOOTSTRAP_HOURS,
     HEDGEHOG_EVENT_MAX_RANGE_PCT,
     HEDGEHOG_EVENT_MIN_NEEDLES,
+    SPIKE_REVERSAL_EXCHANGES,
+    SPIKE_REVERSAL_HISTORY_SEC,
+    SPIKE_REVERSAL_MIN_COUNT,
+    SPIKE_REVERSAL_DEFAULT_RETURN_PCT,
+    SPIKE_REVERSAL_DEFAULT_MIN_MOVE_PCT,
+    SPIKE_REVERSAL_MAX_DURATION_SEC,
     EARLY_RANGE_MIN_PCT,
     EARLY_RANGE_MAX_PCT,
     EARLY_VOL_MIN_USD,
@@ -66,6 +72,8 @@ if getattr(sys, "frozen", False):
 else:
     _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(_APP_DIR, "config.json")
+TMM_CUTTER_DATA_DIR = os.path.join(_APP_DIR, "tmm_cutter_data")
+TMM_CUTTER_SOURCE_FFMPEG = r"C:\TMM_Cutter\ffmpeg.exe"
 
 # _RESOURCE_DIR — для ВШИТЫХ read-only файлов (звуки и т.п.), в отличие от
 # _APP_DIR выше (для config.json/debug.log — то, что приложение само пишет
@@ -77,6 +85,8 @@ if getattr(sys, "frozen", False):
 else:
     _RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 APPEARED_SOUND_PATH = os.path.join(_RESOURCE_DIR, "sounds", "Sound_07.wav")
+APP_ICON_PNG = os.path.join(_RESOURCE_DIR, "assets", "merged_project_icon.png")
+APP_ICON_ICO = os.path.join(_RESOURCE_DIR, "assets", "merged_project_icon.ico")
 
 BASE_EXCHANGE_CHOICES = ["BINANCE", "ASTERDEX", "GATE", "OKX", "MEXC"]
 SPOT_EXCHANGE_BY_BASE = {
@@ -93,6 +103,7 @@ REST_POLLING_EXCHANGES = set(REST_EXCHANGES)
 TRADE_TAPE_EXCHANGES = {"BINANCE", "BINANCE SPOT"}
 ALL_EXCHANGES_LABEL = "🌐 ВСЕ БИРЖИ"  # спец-пункт в комбобоксе "Биржа" — добавить тикер сразу везде, где он есть
 MARKET_TOP_EXCHANGES = ["BINANCE", "ASTERDEX", "GATE", "OKX"]  # что ПОКАЗЫВАЕМ в "Топ движений"
+MARKET_GROUPED_EXCHANGES = MARKET_TOP_EXCHANGES + ["BYBIT"]
 HEDGEHOG_EXCHANGES = ["BINANCE", "BYBIT", "BINANCE SPOT", "ASTERDEX SPOT", "GATE SPOT", "OKX SPOT"]
 HEDGEHOG_EVENT_EXCHANGES = {"BINANCE", "BYBIT"}
 HEDGEHOG_BOOTSTRAP_ENABLED = True
@@ -101,7 +112,10 @@ HEDGEHOG_BOOTSTRAP_ENABLED = True
 # "Топ движений" всё равно показывает только MARKET_TOP_EXCHANGES (фильтр в
 # _update_movers_trees), а MEXC уходит в "Ранние". Без MEXC здесь вкладка
 # "Ранние" была бы мертва — это тихо ломалось при слиянии веток.
-MARKET_SCAN_EXCHANGES = MARKET_TOP_EXCHANGES + ["BYBIT", "MEXC SPOT"]
+MARKET_SCAN_EXCHANGES = MARKET_GROUPED_EXCHANGES + ["MEXC SPOT"]
+MOVERS_VIEW_EXCHANGE = "По биржам"
+MOVERS_VIEW_SYMBOL_LEGACY = "По монетам"
+MOVERS_VIEW_SYMBOL = "Общее"
 EXCHANGE_SHORT_LABELS = {
     "BINANCE": "BIN",
     "BINANCE SPOT": "BIN S",
@@ -199,7 +213,7 @@ ALERT_FILTERS = [
 BEEP_FREQ = {
     "APPEARED": 700, "MAGNET": 1000, "PUSH": 1100, "EATEN": 500, "PULLED": 350,
     "WALL": 1200, "WALL_GONE": 400, "CASCADE": 1500, "IMPULSE": 850,
-    "HEDGEHOG_NEEDLES": 1050, "HEDGEHOG_BOOK": 1350,
+    "HEDGEHOG_NEEDLES": 1050, "HEDGEHOG_BOOK": 1350, "SPIKE_REVERSAL": 1250,
 }
 
 WALLS_PUSH_INTERVAL = 1.0
@@ -208,6 +222,9 @@ DEFAULT_MAX_DISTANCE_PCT = 10.0  # дефолт "Дистанция %" — со�
 MIN_DISTANCE_PCT = NEAR_SPREAD_PCT  # если пользователь вводит 0, ищем в минимальном практическом радиусе от спреда
 DEFAULT_SINGLE_CONFIRM_SEC = 10.0  # сколько секунд плотность должна прожить до алерта по умолчанию
 MIN_SINGLE_CONFIRM_SEC = 0.0  # 0 = без ожидания: алерт сразу на первом подходящем скане
+DEFAULT_NOTIFICATIONS_ENABLED = False
+DEFAULT_DENSITY_ALERTS_MUTED = True
+DENSITY_AUTO_ONLY = False
 
 
 def _parse_decimal(value):
@@ -240,6 +257,24 @@ def _format_compact_usd(value):
     if value >= 1_000:
         return f"{sign}${_trim(value / 1_000)}к"
     return f"{sign}${value:.0f}"
+
+
+def _format_price(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if value <= 0:
+        return "-"
+    if value >= 1000:
+        text = f"{value:,.2f}"
+    elif value >= 1:
+        text = f"{value:.6f}"
+    elif value >= 0.01:
+        text = f"{value:.8f}"
+    else:
+        text = f"{value:.10f}"
+    return text.rstrip("0").rstrip(".")
 
 
 def _parse_compact_usd(value):
@@ -310,6 +345,29 @@ HEDGEHOG_EVENT_LABELS = {
 HEDGEHOG_EVENT_COLORS = {
     "HEDGEHOG_NEEDLES": EVENT_COLORS["PUSH"],
     "HEDGEHOG_BOOK": EVENT_COLORS["WALL"],
+}
+
+SPIKE_REVERSAL_SETTINGS_FILE = os.path.join(_APP_DIR, "spike_reversal_settings.json")
+SPIKE_REVERSAL_RETURN_MIN_PCT = 70.0
+SPIKE_REVERSAL_RETURN_MAX_PCT = 100.0
+SPIKE_REVERSAL_MIN_MOVE_MIN_PCT = 0.1
+SPIKE_REVERSAL_MIN_MOVE_MAX_PCT = 50.0
+SPIKE_REVERSAL_HISTORY_MIN_MINUTES = 5.0
+SPIKE_REVERSAL_HISTORY_MAX_MINUTES = int(SPIKE_REVERSAL_HISTORY_SEC / 60)
+SPIKE_REVERSAL_MAX_ROWS = 200
+SPIKE_REVERSAL_REALERT_SEC = 15 * 60
+SPIKE_REVERSAL_FRESH_SEC = 3 * 60
+SPIKE_REVERSAL_FILTERS = [
+    ("down", "Падение+откуп"),
+    ("up", "Рост+слив"),
+]
+SPIKE_REVERSAL_LABELS = {
+    "down": "ПАДЕНИЕ+ОТКУП",
+    "up": "РОСТ+СЛИВ",
+}
+SPIKE_REVERSAL_COLORS = {
+    "down": SIDE_COLOR["bid"],
+    "up": SIDE_COLOR["ask"],
 }
 
 # "Ранние" (вотч-лист живой тишины). Монета должна продержаться в профиле
@@ -384,13 +442,33 @@ class App:
         self.root.geometry("1380x900")
         self.root.minsize(1100, 700)
         self.root.configure(bg="#0a0a0d")
+        self.root.pack_propagate(False)
+        self._app_icon_photo = None
+        icon_applied = False
+        icon_errors = []
+        try:
+            if os.path.exists(APP_ICON_ICO):
+                self.root.iconbitmap(APP_ICON_ICO)
+                icon_applied = True
+        except Exception as error:
+            icon_errors.append(error)
+        try:
+            if os.path.exists(APP_ICON_PNG):
+                self._app_icon_photo = tk.PhotoImage(file=APP_ICON_PNG)
+                self.root.iconphoto(True, self._app_icon_photo)
+                icon_applied = True
+        except Exception as error:
+            icon_errors.append(error)
+        if not icon_applied and icon_errors:
+            dlog(f"Window icon failed: {icon_errors[-1]!r}")
 
         self.orderbooks = {}       # "EXCH:SYMBOL" -> OrderBook
         self.detector = WallDetector()
         self.ws_managers = {}      # exchange -> manager instance
+        self.scanner_running = False
         self.event_queue = queue.Queue()
         self.status_var = tk.StringVar(value="Отключено")
-        self.sound_enabled = tk.BooleanVar(value=True)
+        self.sound_enabled = tk.BooleanVar(value=DEFAULT_NOTIFICATIONS_ENABLED)
         self._last_walls_push = {}
         self.muted_keys = set()    # "EXCH:SYMBOL" с выключенными алертами (детекция всё равно идёт)
         self._resyncing = set()    # "EXCH:SYMBOL", для которых сейчас уже идёт REST-ресинк (не дублировать)
@@ -410,6 +488,13 @@ class App:
         self._symbol_suggestion_lock = threading.Lock()
         self._symbol_suggestion_refreshing = False
         self._ui_settings = self._load_ui_settings()
+        self.movers_view_var = tk.StringVar(value=MOVERS_VIEW_EXCHANGE)
+        self._last_market_tickers = []
+        self._auto_density_keys = set()
+        self._suppressed_auto_density_keys = self._load_suppressed_auto_density_keys()
+        self._loaded_config_keys = set()
+        self._density_sync_signature = None
+        self._wall_snapshots = {}
         self.audit_writer = AuditCsvWriter(_APP_DIR)
         self.audit_enabled = tk.BooleanVar(value=False)
         self.trade_tape = TradeTape()
@@ -418,8 +503,8 @@ class App:
         self.print_min_usd = DEFAULT_PRINT_MIN_USD
         self.print_max_usd = DEFAULT_PRINT_MAX_USD
         self._load_print_settings()
-        self.hedgehog_event_popup_enabled = tk.BooleanVar(value=True)
-        self.hedgehog_event_sound_enabled = tk.BooleanVar(value=True)
+        self.hedgehog_event_popup_enabled = tk.BooleanVar(value=DEFAULT_NOTIFICATIONS_ENABLED)
+        self.hedgehog_event_sound_enabled = tk.BooleanVar(value=DEFAULT_NOTIFICATIONS_ENABLED)
         self._hedgehog_event_rows = []
         self._hedgehog_event_row_kinds = {}
         self._next_hedgehog_event_seq = 0
@@ -430,6 +515,17 @@ class App:
         self._hedgehog_event_scan_stats = {}
         self._hedgehog_bootstrap_stats = {}
         self._load_hedgehog_event_settings()
+        self.reversal_return_pct = SPIKE_REVERSAL_DEFAULT_RETURN_PCT
+        self.reversal_min_move_pct = SPIKE_REVERSAL_DEFAULT_MIN_MOVE_PCT
+        self.reversal_history_minutes = int(SPIKE_REVERSAL_HISTORY_SEC / 60)
+        self.reversal_popup_enabled = tk.BooleanVar(value=DEFAULT_NOTIFICATIONS_ENABLED)
+        self.reversal_sound_enabled = tk.BooleanVar(value=DEFAULT_NOTIFICATIONS_ENABLED)
+        self._reversal_rows = []
+        self._last_reversal_candidates = []
+        self._reversal_last_alert = {}
+        self._reversal_scan_stats = {}
+        self._load_reversal_settings()
+        self.tmm_cutter = None
 
         # "Импульс" (вкладка "Топ движений") — всплывающие уведомления,
         # видимые независимо от активной вкладки. Порог/окно настраиваются
@@ -437,14 +533,14 @@ class App:
         # (не config.json — тот список монет, а не dict настроек).
         self.impulse_threshold_pct = MARKET_IMPULSE_HIGHLIGHT_PCT
         self.impulse_window_sec = MARKET_IMPULSE_WINDOW_SEC
-        self.impulse_popup_enabled = tk.BooleanVar(value=True)
-        self.impulse_sound_enabled = tk.BooleanVar(value=True)
+        self.impulse_popup_enabled = tk.BooleanVar(value=DEFAULT_NOTIFICATIONS_ENABLED)
+        self.impulse_sound_enabled = tk.BooleanVar(value=DEFAULT_NOTIFICATIONS_ENABLED)
         self._impulse_above = {}          # "EXCH:SYMBOL" -> был ли последний тик выше порога (для edge-триггера)
         self._active_impulse_toasts = []  # список открытых Toplevel-тостов, для стека/перепозиционирования
         self._load_impulse_settings()
 
         # "Ранние" — вотч-лист монет в "живой тишине" (профиль до памп-выноса)
-        self.early_alerts_enabled = tk.BooleanVar(value=True)
+        self.early_alerts_enabled = tk.BooleanVar(value=DEFAULT_NOTIFICATIONS_ENABLED)
         # по умолчанию включено: монеты, уже торгующиеся на Binance/OKX/Bybit,
         # имеют толстый стакан и на +50% с тонкой книги не выносятся
         self.early_exclusive_only = tk.BooleanVar(value=True)
@@ -454,8 +550,11 @@ class App:
         self._apply_ui_settings_to_vars()
 
         self._build_ui()
+        self._apply_density_entry_settings()
         self.root.bind_all("<KeyPress>", self._on_global_keypress, add="+")
         self._load_config()
+        self._load_last_density_targets()
+        self._start_density_scanner()
         self._seed_symbol_suggestions_from_rows()
         self._refresh_symbol_suggestions_async()
         self.root.after(100, self._poll_queue)
@@ -472,6 +571,7 @@ class App:
         # Оставляем старые futures-источники и добавляем spot-рынки.
         self.hedgehog_scanner = MarketScanner(self._on_hedgehog_update, self._on_status,
                                                exchanges=HEDGEHOG_EXCHANGES)
+        self._apply_reversal_settings_to_scanner()
         self.hedgehog_scanner.start()
         if HEDGEHOG_BOOTSTRAP_ENABLED:
             threading.Thread(target=self.hedgehog_scanner.bootstrap_hedgehog_history,
@@ -511,17 +611,25 @@ class App:
         tab_movers = tk.Frame(self.notebook, bg="#0a0a0d")
         tab_hedgehog = tk.Frame(self.notebook, bg="#0a0a0d")
         tab_hedgehog_events = tk.Frame(self.notebook, bg="#0a0a0d")
+        tab_reversal = tk.Frame(self.notebook, bg="#0a0a0d")
         tab_early = tk.Frame(self.notebook, bg="#0a0a0d")
+        tab_tmm = tk.Frame(self.notebook, bg="#1a1b2e")
         self.tab_scanner = tab_scanner
         self.tab_movers = tab_movers
         self.tab_hedgehog = tab_hedgehog
         self.tab_hedgehog_events = tab_hedgehog_events
+        self.tab_reversal = tab_reversal
         self.tab_early = tab_early
+        self.tab_tmm = tab_tmm
         self.notebook.add(tab_scanner, text="Сканер плотностей")
         self.notebook.add(tab_movers, text="Топ движений")
         self.notebook.add(tab_hedgehog, text="🦔 Ерши")
         self.notebook.add(tab_hedgehog_events, text="События ершей")
+        self.notebook.add(tab_reversal, text="Вылет/вкат")
         self.notebook.add(tab_early, text="🎯 Ранние")
+
+        self.notebook.add(tab_tmm, text="TMM Cutter")
+        self._build_tmm_cutter_tab(tab_tmm)
 
         top = tk.Frame(tab_scanner, bg="#0a0a0d")
         top.pack(fill="x", padx=10, pady=(10, 4))
@@ -573,6 +681,7 @@ class App:
 
         tk.Label(top, text="от $:", bg="#0a0a0d", fg="white").grid(row=0, column=6, padx=4, sticky="w")
         self.threshold_entry = tk.Entry(top, width=9)
+        self.threshold_entry.insert(0, str(MOVER_ADD_DEFAULT_FLOOR))
         self.threshold_entry.grid(row=0, column=7, padx=4)
 
         tk.Label(top, text="до $:", bg="#0a0a0d", fg="white").grid(row=0, column=8, padx=4, sticky="w")
@@ -595,6 +704,9 @@ class App:
         self.single_confirm_entry = tk.Entry(top, width=9)
         self.single_confirm_entry.insert(0, str(DEFAULT_SINGLE_CONFIRM_SEC))
         self.single_confirm_entry.grid(row=1, column=5, padx=4, pady=(6, 0), sticky="w")
+        tk.Button(top, text="Применить фильтры", command=self._apply_density_filters,
+                  bg="#1f1f24", fg="white", relief="flat", padx=8).grid(
+            row=1, column=6, columnspan=3, padx=(10, 4), pady=(6, 0), sticky="w")
 
         top2 = tk.Frame(tab_scanner, bg="#0a0a0d")
         top2.pack(fill="x", padx=10, pady=(0, 8))
@@ -606,31 +718,27 @@ class App:
         tk.Button(top2, text="🔇 Вкл/выкл алерты", command=self._toggle_mute,
                   bg="#1f1f24", fg="white", relief="flat", padx=8).grid(row=0, column=2, padx=4)
 
-        self.start_btn = tk.Button(top2, text="▶ Старт", command=self._toggle_start,
-                                    bg="#16a34a", fg="white", width=10, relief="flat")
-        self.start_btn.grid(row=0, column=3, padx=12)
-
         sound_chk = tk.Checkbutton(top2, text="🔔 Звук", variable=self.sound_enabled,
                                     command=self._save_ui_settings,
                                     bg="#0a0a0d", fg="white", selectcolor="#131316",
                                     activebackground="#0a0a0d", activeforeground="white")
-        sound_chk.grid(row=0, column=4, padx=4)
+        sound_chk.grid(row=0, column=3, padx=(12, 4))
         tk.Button(top2, text="💾 Экспорт конфига", command=self._export_config,
-                  bg="#1f1f24", fg="white", relief="flat", padx=8).grid(row=0, column=5, padx=(12, 4))
+                  bg="#1f1f24", fg="white", relief="flat", padx=8).grid(row=0, column=4, padx=(12, 4))
         tk.Button(top2, text="📂 Импорт конфига", command=self._import_config,
-                  bg="#1f1f24", fg="white", relief="flat", padx=8).grid(row=0, column=6, padx=4)
+                  bg="#1f1f24", fg="white", relief="flat", padx=8).grid(row=0, column=5, padx=4)
         self.audit_btn = tk.Button(top2, text="csv", command=self._toggle_audit,
                                     bg="#0a0a0d", fg="#343842", activebackground="#0a0a0d",
                                     activeforeground="#737883", relief="flat", bd=0,
                                     highlightthickness=0, padx=2, pady=0, width=4,
                                     font=("Segoe UI", 7), cursor="hand2")
-        self.audit_btn.grid(row=0, column=7, padx=(4, 0))
+        self.audit_btn.grid(row=0, column=6, padx=(4, 0))
 
         tk.Label(top2, text="🧱 Стенка = 3+ плотности рядом (отдельно от 🟨 одиночной). "
                              "Пустое «до $» = «от и выше» (без разницы, насколько крупная). "
                              "Двойной клик по строке — редактировать.",
                  bg="#0a0a0d", fg="#6b7078", font=("Segoe UI", 9)).grid(
-            row=1, column=0, columnspan=9, padx=(0, 4), pady=(6, 0), sticky="w")
+            row=1, column=0, columnspan=8, padx=(0, 4), pady=(6, 0), sticky="w")
 
         mid = tk.Frame(tab_scanner, bg="#0a0a0d")
         mid.pack(fill="x", padx=10, pady=4)
@@ -672,8 +780,9 @@ class App:
 
         prints_frame = tk.Frame(details_notebook, bg="#0a0a0d")
         walls_frame = tk.Frame(details_notebook, bg="#0a0a0d")
-        details_notebook.add(prints_frame, text="Повторяющиеся принты")
         details_notebook.add(walls_frame, text="Активные плотности")
+        details_notebook.add(prints_frame, text="Повторяющиеся принты")
+        details_notebook.select(walls_frame)
 
         prints_controls = tk.Frame(prints_frame, bg="#0a0a0d")
         prints_controls.pack(fill="x", pady=(2, 4))
@@ -719,6 +828,24 @@ class App:
         prints_scroll.pack(side="right", fill="y")
         self.prints_tree.bind("<Double-1>", lambda e: self._copy_symbol_from_tree(self.prints_tree, 2))
         self.prints_tree.bind("<Button-3>", lambda e: self._copy_symbol_from_tree_event(self.prints_tree, 2, e))
+
+        walls_controls = tk.Frame(walls_frame, bg="#0a0a0d")
+        walls_controls.pack(fill="x", pady=(2, 4))
+        active_filters = self._ui_settings.get("active_wall_filters", {}) if isinstance(self._ui_settings, dict) else {}
+        if not isinstance(active_filters, dict):
+            active_filters = {}
+        tk.Label(walls_controls, text="Показывать: от $:", bg="#0a0a0d", fg="white").pack(side="left", padx=(0, 4))
+        self.active_wall_min_usd_entry = tk.Entry(walls_controls, width=9)
+        self.active_wall_min_usd_entry.insert(0, str(active_filters.get("min_usd", MOVER_ADD_DEFAULT_FLOOR)))
+        self.active_wall_min_usd_entry.pack(side="left", padx=(0, 12))
+        tk.Label(walls_controls, text="жизнь от, с:", bg="#0a0a0d", fg="white").pack(side="left", padx=(0, 4))
+        self.active_wall_min_age_entry = tk.Entry(walls_controls, width=8)
+        self.active_wall_min_age_entry.insert(0, str(active_filters.get("min_age_sec", DEFAULT_SINGLE_CONFIRM_SEC)))
+        self.active_wall_min_age_entry.pack(side="left", padx=(0, 12))
+        tk.Button(walls_controls, text="Применить", command=self._apply_active_wall_filters,
+                  bg="#1f1f24", fg="white", relief="flat", padx=8).pack(side="left")
+        self.active_wall_min_usd_entry.bind("<Return>", lambda _e: self._apply_active_wall_filters())
+        self.active_wall_min_age_entry.bind("<Return>", lambda _e: self._apply_active_wall_filters())
 
         wcols = ("exchange", "symbol", "side", "price", "usd", "age", "dist")
         wheaders = {"exchange": "Биржа", "symbol": "Символ", "side": "Сторона", "price": "Цена",
@@ -774,9 +901,8 @@ class App:
         self._build_movers_tab(tab_movers)
         self._build_hedgehog_tab(tab_hedgehog)
         self._build_hedgehog_events_tab(tab_hedgehog_events)
+        self._build_spike_reversal_tab(tab_reversal)
         self._build_early_tab(tab_early)
-        self.notebook.pack(fill="both", expand=True, padx=10, pady=(10, 0))
-
         status_bar = tk.Label(self.root, textvariable=self.status_var,
                                bg="#000000", fg="#9aa0a6", anchor="w", padx=8)
         status_bar.pack(fill="x", side="bottom")
@@ -797,6 +923,57 @@ class App:
                            font=("Segoe UI", 8, "bold"), padx=3)
             lbl.pack(side="left", padx=(0, 5))
             self.conn_labels[exch] = lbl
+
+        # Pack the expandable notebook after the fixed bottom bars so connection
+        # status always keeps visible space, even when an embedded tab asks for
+        # a large height.
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+
+    def _build_tmm_cutter_tab(self, parent):
+        for child in parent.winfo_children():
+            child.destroy()
+        parent.pack_propagate(False)
+        parent.grid_propagate(False)
+        os.makedirs(TMM_CUTTER_DATA_DIR, exist_ok=True)
+        os.environ["TMM_CUTTER_DATA_DIR"] = TMM_CUTTER_DATA_DIR
+        for ffmpeg_path in (os.path.join(_APP_DIR, "ffmpeg.exe"), TMM_CUTTER_SOURCE_FFMPEG):
+            if os.path.isfile(ffmpeg_path):
+                os.environ["TMM_CUTTER_FFMPEG_PATH"] = ffmpeg_path
+                break
+        try:
+            from tmm_cutter_embedded import TMMVideoCutter
+            self.tmm_cutter = TMMVideoCutter(self.root, embedded=True, container=parent)
+        except Exception as error:
+            self.tmm_cutter = None
+            dlog(f"TMM Cutter tab failed: {error!r}")
+            box = tk.Frame(parent, bg="#1a1b2e", padx=24, pady=24)
+            box.pack(fill="both", expand=True)
+            tk.Label(
+                box,
+                text="TMM Cutter не загрузился",
+                bg="#1a1b2e",
+                fg="#d35a5a",
+                font=("Segoe UI", 14, "bold"),
+            ).pack(anchor="w")
+            tk.Label(
+                box,
+                text=str(error),
+                bg="#1a1b2e",
+                fg="#c8cdd0",
+                wraplength=900,
+                justify="left",
+                font=("Segoe UI", 10),
+            ).pack(anchor="w", pady=(10, 16))
+            tk.Button(
+                box,
+                text="Повторить загрузку",
+                command=lambda: self._build_tmm_cutter_tab(parent),
+                bg="#2563eb",
+                fg="white",
+                relief="flat",
+                padx=12,
+                pady=7,
+            ).pack(anchor="w")
 
     def _build_movers_tab(self, parent):
         """Вкладка «Топ движений»: топ-20 роста и топ-20 падения за 24ч по
@@ -832,10 +1009,19 @@ class App:
         tk.Button(settings, text="Применить", command=self._apply_impulse_settings,
                   bg="#2563eb", fg="white", relief="flat", padx=8).grid(row=0, column=7)
 
+        view_bar = tk.Frame(parent, bg="#0a0a0d")
+        view_bar.pack(fill="x", padx=4, pady=(4, 0))
+        tk.Label(view_bar, text="Режим:", bg="#0a0a0d", fg="white",
+                 font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 8))
+        self.movers_view_btn = tk.Button(view_bar, text="", command=self._toggle_movers_view,
+                                         bg="#1f1f24", fg="white", relief="flat", padx=10)
+        self.movers_view_btn.pack(side="left")
+
         self.movers_hint_var = tk.StringVar()
         hint = tk.Label(parent, textvariable=self.movers_hint_var,
-                         bg="#0a0a0d", fg="#6b7078", font=("Segoe UI", 9))
-        hint.pack(anchor="w", padx=4, pady=(6, 4))
+                         bg="#0a0a0d", fg="#6b7078", font=("Segoe UI", 9),
+                         anchor="w", justify="left")
+        hint.pack(fill="x", padx=4, pady=(4, 4))
         self._update_movers_hint()
 
         split = tk.Frame(parent, bg="#0a0a0d")
@@ -854,6 +1040,8 @@ class App:
                      font=("Segoe UI", 11, "bold")).pack(anchor="w")
             inner = tk.Frame(frame, bg="#0a0a0d")
             inner.pack(fill="both", expand=True)
+            inner.grid_rowconfigure(0, weight=1)
+            inner.grid_columnconfigure(0, weight=1)
             tv = ttk.Treeview(inner, columns=mcols, show="headings")
             for c in mcols:
                 tv.heading(c, text=mheaders[c])
@@ -863,15 +1051,15 @@ class App:
             tv.tag_configure("impulse", foreground=EVENT_COLORS["MAGNET"])
             scroll = ttk.Scrollbar(inner, orient="vertical", command=tv.yview)
             tv.configure(yscrollcommand=scroll.set)
-            tv.pack(side="left", fill="both", expand=True)
-            scroll.pack(side="right", fill="y")
+            tv.grid(row=0, column=0, sticky="nsew")
+            scroll.grid(row=0, column=1, sticky="ns")
             tv.bind("<Double-1>", self._on_mover_double_click)
             tv.bind("<Button-3>", lambda e, tree=tv: self._copy_symbol_from_tree_event(tree, 1, e))
-            frame.pack(side="left", fill="both", expand=True, padx=(0, 6))
-            return tv
+            return frame, tv
 
-        self.gainers_tree = make_movers_tree(split, "🚀 Топ роста (24ч)")
-        self.losers_tree = make_movers_tree(split, "📉 Топ падения (24ч)")
+        self.gainers_movers_frame, self.gainers_tree = make_movers_tree(split, "🚀 Топ роста (24ч)")
+        self.losers_movers_frame, self.losers_tree = make_movers_tree(split, "📉 Топ падения (24ч)")
+        self._configure_movers_tree_headers()
 
     def _build_hedgehog_tab(self, parent):
         """Вкладка «Ерши»: узкий боковой диапазон + частые касания обеих
@@ -970,6 +1158,80 @@ class App:
         self.hedgehog_events_tree.bind("<Button-3>",
                                        lambda e: self._copy_symbol_from_tree_event(self.hedgehog_events_tree, 2, e))
 
+    def _build_spike_reversal_tab(self, parent):
+        hint = tk.Label(parent,
+                         text="Binance futures и Bybit. Ищет быстрый вылет цены и возврат назад за 1-2 минуты. "
+                              f"В таблицу попадает монета, где таких повторов минимум {SPIKE_REVERSAL_MIN_COUNT}.",
+                         bg="#0a0a0d", fg="#6b7078", font=("Segoe UI", 9))
+        hint.pack(anchor="w", padx=4, pady=(8, 4))
+
+        bar = tk.Frame(parent, bg="#0a0a0d")
+        bar.pack(fill="x", padx=4, pady=(0, 4))
+        tk.Label(bar, text="Возврат %:", bg="#0a0a0d", fg="white").pack(side="left", padx=(0, 4))
+        self.reversal_return_entry = tk.Entry(bar, width=7)
+        self.reversal_return_entry.insert(0, f"{self.reversal_return_pct:g}")
+        self.reversal_return_entry.pack(side="left", padx=(0, 12))
+        tk.Label(bar, text="Мин. вылет %:", bg="#0a0a0d", fg="white").pack(side="left", padx=(0, 4))
+        self.reversal_min_move_entry = tk.Entry(bar, width=7)
+        self.reversal_min_move_entry.insert(0, f"{self.reversal_min_move_pct:g}")
+        self.reversal_min_move_entry.pack(side="left", padx=(0, 12))
+        tk.Label(bar, text="История, мин:", bg="#0a0a0d", fg="white").pack(side="left", padx=(0, 4))
+        self.reversal_history_entry = tk.Entry(bar, width=7)
+        self.reversal_history_entry.insert(0, f"{self.reversal_history_minutes:g}")
+        self.reversal_history_entry.pack(side="left", padx=(0, 12))
+
+        self.reversal_filter_vars = {}
+        for kind, label in SPIKE_REVERSAL_FILTERS:
+            var = tk.BooleanVar(value=self._ui_filter_value("spike_reversal_filters", kind, True))
+            self.reversal_filter_vars[kind] = var
+            tk.Checkbutton(bar, text=label, variable=var, command=self._on_reversal_filter_changed,
+                           bg="#0a0a0d", fg="#d1d5db", selectcolor="#131316",
+                           activebackground="#0a0a0d", activeforeground="white",
+                           font=("Segoe UI", 9)).pack(side="left", padx=(0, 10))
+        tk.Checkbutton(bar, text="Всплывающее окно", variable=self.reversal_popup_enabled,
+                       command=self._on_reversal_checkbox_changed,
+                       bg="#0a0a0d", fg="white", selectcolor="#131316",
+                       activebackground="#0a0a0d", activeforeground="white").pack(side="left", padx=(8, 0))
+        tk.Checkbutton(bar, text="Звук", variable=self.reversal_sound_enabled,
+                       command=self._on_reversal_checkbox_changed,
+                       bg="#0a0a0d", fg="white", selectcolor="#131316",
+                       activebackground="#0a0a0d", activeforeground="white").pack(side="left", padx=(12, 0))
+        tk.Button(bar, text="Применить", command=self._apply_reversal_settings,
+                  bg="#2563eb", fg="white", relief="flat", padx=8).pack(side="left", padx=(12, 0))
+        self.reversal_return_entry.bind("<Return>", lambda _e: self._apply_reversal_settings())
+        self.reversal_min_move_entry.bind("<Return>", lambda _e: self._apply_reversal_settings())
+        self.reversal_history_entry.bind("<Return>", lambda _e: self._apply_reversal_settings())
+
+        self.reversal_status_var = tk.StringVar(value="прогрев: ждём первые данные...")
+        tk.Label(parent, textvariable=self.reversal_status_var,
+                 bg="#0a0a0d", fg="#6b7078", font=("Segoe UI", 9),
+                 anchor="w").pack(fill="x", padx=4, pady=(0, 4))
+
+        frame = tk.Frame(parent, bg="#0a0a0d")
+        frame.pack(fill="both", expand=True, padx=4, pady=(0, 8))
+        cols = ("exchange", "symbol", "kind", "count", "last", "move", "avg",
+                "return", "speed", "when", "details")
+        headers = {"exchange": "Биржа", "symbol": "Символ", "kind": "Тип",
+                   "count": "Повторов", "last": "Цена", "move": "Посл. вылет",
+                   "avg": "Средн.", "return": "Возврат", "speed": "Скорость",
+                   "when": "Когда", "details": "Детали"}
+        widths = {"exchange": 110, "symbol": 130, "kind": 130, "count": 80,
+                  "last": 95, "move": 95, "avg": 85, "return": 85,
+                  "speed": 85, "when": 80, "details": 300}
+        self.reversal_tree = ttk.Treeview(frame, columns=cols, show="headings")
+        for c in cols:
+            self.reversal_tree.heading(c, text=headers[c])
+            self.reversal_tree.column(c, width=widths[c], anchor="center" if c != "details" else "w")
+        for kind, color in SPIKE_REVERSAL_COLORS.items():
+            self.reversal_tree.tag_configure(kind, foreground=color)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.reversal_tree.yview)
+        self.reversal_tree.configure(yscrollcommand=scroll.set)
+        self.reversal_tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.reversal_tree.bind("<Double-1>", lambda e: self._copy_symbol_from_tree(self.reversal_tree, 1))
+        self.reversal_tree.bind("<Button-3>",
+                                lambda e: self._copy_symbol_from_tree_event(self.reversal_tree, 1, e))
+
     def _build_early_tab(self, parent):
         """Вкладка «🎯 Ранние»: монеты MEXC в состоянии "живой тишины" — тот
         профиль, который был у 7 из 9 размеченных пампов за час до старта
@@ -1041,6 +1303,7 @@ class App:
                 self.threshold_entry.insert(0, str(lo))
             if hi is not None:
                 self.threshold_max_entry.insert(0, str(hi))
+            self._apply_density_filters()
             return
 
     def _on_exchange_selected(self, _event=None):
@@ -1259,7 +1522,7 @@ class App:
         return [exchange]
 
     def _add_symbol(self, symbol=None, threshold=None, direction=None, exchange=None,
-                     mode=None, muted=False, silent=False, threshold_max=_UNSET,
+                     mode=None, muted=DEFAULT_DENSITY_ALERTS_MUTED, silent=False, threshold_max=_UNSET,
                      max_distance_pct=_UNSET, single_confirm_sec=_UNSET,
                      exact_exchange=False):
         exchange = (exchange or self.exchange_combo.get()).upper()
@@ -1359,6 +1622,9 @@ class App:
         self.detector.set_config(cfg)
 
         key = f"{exchange}:{symbol}"
+        self._auto_density_keys.discard(key)
+        self._loaded_config_keys.discard(key)
+        self._suppressed_auto_density_keys.discard(key)
         if muted:
             self.muted_keys.add(key)
         alerts_display = "🔇 Выкл" if key in self.muted_keys else "🔔 Вкл"
@@ -1374,7 +1640,7 @@ class App:
                                       direction, "-", "-", 0, alerts_display, threshold_max_display,
                                       max_distance_display, single_confirm_display))
             self._add_symbol_to_suggestions(symbol_display)
-            if self.ws_managers:
+            if self.scanner_running:
                 self._ensure_manager(exchange)
                 threading.Thread(target=self._validate_and_subscribe,
                                   args=(exchange, symbol), daemon=True).start()
@@ -1475,6 +1741,11 @@ class App:
             self.orderbooks.pop(key, None)
             self.detector.remove_symbol(exchange, symbol)
             self.muted_keys.discard(key)
+            if key in self._auto_density_keys:
+                self._suppressed_auto_density_keys.add(key)
+            self._auto_density_keys.discard(key)
+            self._loaded_config_keys.discard(key)
+            self._wall_snapshots.pop(key, None)
             self.tree.delete(key)
             for iid in list(self.walls_tree.get_children()):
                 if iid.startswith(f"{key}|"):
@@ -1483,6 +1754,7 @@ class App:
             removed.append(key)
 
         self._save_config()
+        self._save_ui_settings()
         if removed:
             self.status_var.set(f"Удалено из сканера: {len(removed)}")
         return "break" if _event is not None else None
@@ -1641,6 +1913,20 @@ class App:
         except Exception:
             return {}
 
+    def _load_suppressed_auto_density_keys(self):
+        values = self._ui_settings.get("suppressed_auto_density_keys", [])
+        if not isinstance(values, list):
+            return set()
+        result = set()
+        for value in values:
+            text = str(value or "").strip().upper()
+            if ":" not in text:
+                continue
+            exchange, symbol = text.split(":", 1)
+            if exchange in EXCHANGE_CHOICES and symbol:
+                result.add(f"{exchange}:{_normalize_symbol_input(symbol, exchange)}")
+        return result
+
     def _ui_filter_value(self, section, kind, default=True):
         values = self._ui_settings.get(section, {})
         if isinstance(values, dict) and kind in values:
@@ -1651,18 +1937,40 @@ class App:
         values = self._ui_settings
         if not isinstance(values, dict):
             return
+        notification_keys = (
+            "sound_enabled",
+            "impulse_popup_enabled",
+            "impulse_sound_enabled",
+            "hedgehog_event_popup_enabled",
+            "hedgehog_event_sound_enabled",
+            "spike_reversal_popup_enabled",
+            "spike_reversal_sound_enabled",
+            "early_alerts_enabled",
+        )
+        if not values.get("notifications_default_off_v1"):
+            for key in notification_keys:
+                values[key] = DEFAULT_NOTIFICATIONS_ENABLED
+            values["notifications_default_off_v1"] = True
+            self._ui_settings = values
         mapping = {
             "sound_enabled": self.sound_enabled,
             "impulse_popup_enabled": self.impulse_popup_enabled,
             "impulse_sound_enabled": self.impulse_sound_enabled,
             "hedgehog_event_popup_enabled": self.hedgehog_event_popup_enabled,
             "hedgehog_event_sound_enabled": self.hedgehog_event_sound_enabled,
+            "spike_reversal_popup_enabled": self.reversal_popup_enabled,
+            "spike_reversal_sound_enabled": self.reversal_sound_enabled,
             "early_alerts_enabled": self.early_alerts_enabled,
             "early_exclusive_only": self.early_exclusive_only,
         }
         for key, var in mapping.items():
             if key in values:
                 var.set(bool(values[key]))
+        movers_view = values.get("movers_view")
+        if movers_view == MOVERS_VIEW_SYMBOL_LEGACY:
+            self.movers_view_var.set(MOVERS_VIEW_SYMBOL)
+        elif movers_view in (MOVERS_VIEW_EXCHANGE, MOVERS_VIEW_SYMBOL):
+            self.movers_view_var.set(movers_view)
 
     def _save_ui_settings(self):
         data = dict(self._ui_settings) if isinstance(self._ui_settings, dict) else {}
@@ -1672,9 +1980,28 @@ class App:
             "impulse_sound_enabled": bool(self.impulse_sound_enabled.get()),
             "hedgehog_event_popup_enabled": bool(self.hedgehog_event_popup_enabled.get()),
             "hedgehog_event_sound_enabled": bool(self.hedgehog_event_sound_enabled.get()),
+            "spike_reversal_popup_enabled": bool(self.reversal_popup_enabled.get()),
+            "spike_reversal_sound_enabled": bool(self.reversal_sound_enabled.get()),
             "early_alerts_enabled": bool(self.early_alerts_enabled.get()),
             "early_exclusive_only": bool(self.early_exclusive_only.get()),
+            "movers_view": self.movers_view_var.get(),
+            "notifications_default_off_v1": True,
+            "density_auto_only": DENSITY_AUTO_ONLY,
+            "last_density_targets": self._serialize_last_density_targets(),
+            "suppressed_auto_density_keys": sorted(getattr(self, "_suppressed_auto_density_keys", set())),
         })
+        if hasattr(self, "threshold_entry"):
+            data["density_filters"] = {
+                "threshold": self.threshold_entry.get().strip(),
+                "threshold_max": self.threshold_max_entry.get().strip(),
+                "max_distance_pct": self.max_distance_entry.get().strip(),
+                "single_confirm_sec": self.single_confirm_entry.get().strip(),
+            }
+        if hasattr(self, "active_wall_min_usd_entry"):
+            data["active_wall_filters"] = {
+                "min_usd": self.active_wall_min_usd_entry.get().strip(),
+                "min_age_sec": self.active_wall_min_age_entry.get().strip(),
+            }
         if hasattr(self, "alert_filter_vars"):
             data["alert_filters"] = {
                 kind: bool(var.get()) for kind, var in self.alert_filter_vars.items()
@@ -1683,12 +2010,160 @@ class App:
             data["hedgehog_event_filters"] = {
                 kind: bool(var.get()) for kind, var in self.hedgehog_event_filter_vars.items()
             }
+        if hasattr(self, "reversal_filter_vars"):
+            data["spike_reversal_filters"] = {
+                kind: bool(var.get()) for kind, var in self.reversal_filter_vars.items()
+            }
         try:
             with open(UI_SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             self._ui_settings = data
         except Exception:
             pass
+
+    def _apply_density_entry_settings(self):
+        values = self._ui_settings.get("density_filters", {}) if isinstance(self._ui_settings, dict) else {}
+        if not isinstance(values, dict):
+            values = {}
+
+        def set_entry(entry, value, default=""):
+            entry.delete(0, "end")
+            entry.insert(0, str(value if value not in (None, "") else default))
+
+        set_entry(self.threshold_entry, values.get("threshold"), MOVER_ADD_DEFAULT_FLOOR)
+        set_entry(self.threshold_max_entry, values.get("threshold_max"), "")
+        set_entry(self.max_distance_entry, values.get("max_distance_pct"), DEFAULT_MAX_DISTANCE_PCT)
+        set_entry(self.single_confirm_entry, values.get("single_confirm_sec"), DEFAULT_SINGLE_CONFIRM_SEC)
+
+    def _read_density_filter_settings(self, silent=True):
+        try:
+            threshold = _parse_compact_usd(self.threshold_entry.get().strip() or MOVER_ADD_DEFAULT_FLOOR)
+            if threshold is None:
+                raise ValueError
+        except (ValueError, TypeError):
+            if not silent:
+                messagebox.showerror("Фильтры плотностей", "Поле «от $» должно быть числом")
+            return None
+
+        raw_max = self.threshold_max_entry.get().strip()
+        try:
+            threshold_max = _parse_compact_usd(raw_max) if raw_max else None
+        except (ValueError, TypeError):
+            if not silent:
+                messagebox.showerror("Фильтры плотностей", "Поле «до $» должно быть числом")
+            return None
+        if threshold_max is not None and threshold_max <= threshold:
+            if not silent:
+                messagebox.showerror("Фильтры плотностей", "«до $» должно быть больше «от $»")
+            return None
+
+        try:
+            max_distance_pct = _normalize_distance_pct(self.max_distance_entry.get().strip() or DEFAULT_MAX_DISTANCE_PCT)
+        except (ValueError, TypeError):
+            if not silent:
+                messagebox.showerror("Фильтры плотностей", "Поле «Дистанция %» должно быть числом")
+            return None
+
+        try:
+            single_confirm_sec = _normalize_single_confirm_sec(
+                self.single_confirm_entry.get().strip() or DEFAULT_SINGLE_CONFIRM_SEC
+            )
+        except (ValueError, TypeError):
+            if not silent:
+                messagebox.showerror("Фильтры плотностей", "Поле «Жизнь, с» должно быть числом")
+            return None
+
+        return {
+            "threshold": float(threshold),
+            "threshold_max": None if threshold_max is None else float(threshold_max),
+            "max_distance_pct": float(max_distance_pct),
+            "single_confirm_sec": float(single_confirm_sec),
+        }
+
+    def _read_active_wall_filter_settings(self, silent=True):
+        min_usd_raw = self.active_wall_min_usd_entry.get().strip() if hasattr(self, "active_wall_min_usd_entry") else ""
+        min_age_raw = self.active_wall_min_age_entry.get().strip() if hasattr(self, "active_wall_min_age_entry") else ""
+        try:
+            min_usd = _parse_compact_usd(min_usd_raw) if min_usd_raw else 0.0
+            min_usd = 0.0 if min_usd is None else float(min_usd)
+        except (ValueError, TypeError):
+            if not silent:
+                messagebox.showerror("Активные плотности", "Поле «от $» должно быть числом")
+            return None
+        try:
+            min_age_sec = _normalize_single_confirm_sec(min_age_raw) if min_age_raw else 0.0
+        except (ValueError, TypeError):
+            if not silent:
+                messagebox.showerror("Активные плотности", "Поле «жизнь от, с» должно быть числом")
+            return None
+        if min_usd < 0 or min_age_sec < 0:
+            if not silent:
+                messagebox.showerror("Активные плотности", "Фильтры не могут быть меньше нуля")
+            return None
+        return {
+            "min_usd": float(min_usd),
+            "min_age_sec": float(min_age_sec),
+        }
+
+    def _wall_passes_active_filters(self, wall, settings=None):
+        settings = settings or self._read_active_wall_filter_settings(silent=True)
+        if not settings:
+            return True
+        return (
+            float(wall.get("usd", 0.0) or 0.0) >= settings["min_usd"]
+            and float(wall.get("age", 0.0) or 0.0) >= settings["min_age_sec"]
+        )
+
+    def _apply_active_wall_filters(self):
+        settings = self._read_active_wall_filter_settings(silent=False)
+        if not settings:
+            return
+        self.active_wall_min_usd_entry.delete(0, "end")
+        self.active_wall_min_usd_entry.insert(0, f"{settings['min_usd']:g}")
+        self.active_wall_min_age_entry.delete(0, "end")
+        self.active_wall_min_age_entry.insert(0, f"{settings['min_age_sec']:g}")
+        self._save_ui_settings()
+        self._refresh_active_walls_tree()
+        self.status_var.set(
+            f"Активные плотности: от {_format_compact_usd(settings['min_usd'])}, "
+            f"жизнь от {settings['min_age_sec']:g}с"
+        )
+
+    def _refresh_active_walls_tree(self):
+        if not hasattr(self, "walls_tree"):
+            return
+        snapshots = list(getattr(self, "_wall_snapshots", {}).items())
+        for iid in list(self.walls_tree.get_children()):
+            self.walls_tree.delete(iid)
+        self._wall_row_seq.clear()
+        self._next_wall_seq = 0
+        for key, snapshot in snapshots:
+            try:
+                exchange, symbol = key.split(":", 1)
+            except ValueError:
+                continue
+            self._render_walls_snapshot(exchange, symbol, snapshot)
+
+    def _density_filter_signature(self, settings):
+        return (
+            settings["threshold"],
+            settings["threshold_max"],
+            settings["max_distance_pct"],
+            settings["single_confirm_sec"],
+        )
+
+    def _apply_density_filters(self):
+        settings = self._read_density_filter_settings(silent=False)
+        if not settings:
+            return
+        self._suppressed_auto_density_keys.clear()
+        self._density_sync_signature = None
+        self._save_ui_settings()
+        self._sync_density_watchlist_from_movers(self._last_market_tickers, force=True)
+        self.status_var.set(
+            f"Фильтры плотностей применены: от {_format_compact_usd(settings['threshold'])}, "
+            f"жизнь {settings['single_confirm_sec']:g}с"
+        )
 
     def _on_alert_filter_changed(self):
         self._apply_alert_filters()
@@ -1705,6 +2180,92 @@ class App:
     def _on_hedgehog_event_checkbox_changed(self):
         self._save_hedgehog_event_settings()
         self._save_ui_settings()
+
+    def _on_reversal_filter_changed(self):
+        self._update_reversal_tree(self._last_reversal_candidates, self._reversal_scan_stats)
+        self._save_ui_settings()
+
+    def _on_reversal_checkbox_changed(self):
+        self._save_reversal_settings()
+        self._save_ui_settings()
+
+    def _load_reversal_settings(self):
+        if not os.path.exists(SPIKE_REVERSAL_SETTINGS_FILE):
+            return
+        try:
+            with open(SPIKE_REVERSAL_SETTINGS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            self.reversal_return_pct = float(data.get("return_pct", self.reversal_return_pct))
+            self.reversal_min_move_pct = float(data.get("min_move_pct", self.reversal_min_move_pct))
+            self.reversal_history_minutes = float(data.get("history_minutes", self.reversal_history_minutes))
+            self.reversal_popup_enabled.set(bool(data.get("popup_enabled", DEFAULT_NOTIFICATIONS_ENABLED)))
+            self.reversal_sound_enabled.set(bool(data.get("sound_enabled", DEFAULT_NOTIFICATIONS_ENABLED)))
+        except Exception:
+            pass
+
+    def _save_reversal_settings(self):
+        data = {
+            "return_pct": self.reversal_return_pct,
+            "min_move_pct": self.reversal_min_move_pct,
+            "history_minutes": self.reversal_history_minutes,
+            "popup_enabled": bool(self.reversal_popup_enabled.get()),
+            "sound_enabled": bool(self.reversal_sound_enabled.get()),
+        }
+        try:
+            with open(SPIKE_REVERSAL_SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _apply_reversal_settings_to_scanner(self):
+        scanner = getattr(self, "hedgehog_scanner", None)
+        if scanner is None:
+            return
+        scanner.spike_reversal_return_pct = self.reversal_return_pct
+        scanner.spike_reversal_min_move_pct = self.reversal_min_move_pct
+        scanner.spike_reversal_history_sec = float(self.reversal_history_minutes) * 60.0
+        scanner.spike_reversal_max_duration_sec = SPIKE_REVERSAL_MAX_DURATION_SEC
+
+    def _apply_reversal_settings(self):
+        try:
+            return_pct = _parse_decimal(self.reversal_return_entry.get())
+            min_move_pct = _parse_decimal(self.reversal_min_move_entry.get())
+            history_minutes = _parse_decimal(self.reversal_history_entry.get())
+        except ValueError:
+            messagebox.showerror("Вылет/вкат", "Возврат, вылет и история должны быть числами")
+            return
+        if not (SPIKE_REVERSAL_RETURN_MIN_PCT <= return_pct <= SPIKE_REVERSAL_RETURN_MAX_PCT):
+            messagebox.showerror("Вылет/вкат",
+                                 f"Возврат должен быть от {SPIKE_REVERSAL_RETURN_MIN_PCT:g} "
+                                 f"до {SPIKE_REVERSAL_RETURN_MAX_PCT:g}%")
+            return
+        if not (SPIKE_REVERSAL_MIN_MOVE_MIN_PCT <= min_move_pct <= SPIKE_REVERSAL_MIN_MOVE_MAX_PCT):
+            messagebox.showerror("Вылет/вкат",
+                                 f"Мин. вылет должен быть от {SPIKE_REVERSAL_MIN_MOVE_MIN_PCT:g} "
+                                 f"до {SPIKE_REVERSAL_MIN_MOVE_MAX_PCT:g}%")
+            return
+        if not (SPIKE_REVERSAL_HISTORY_MIN_MINUTES <= history_minutes <= SPIKE_REVERSAL_HISTORY_MAX_MINUTES):
+            messagebox.showerror("Вылет/вкат",
+                                 f"История должна быть от {SPIKE_REVERSAL_HISTORY_MIN_MINUTES:g} "
+                                 f"до {SPIKE_REVERSAL_HISTORY_MAX_MINUTES:g} минут")
+            return
+        self.reversal_return_pct = return_pct
+        self.reversal_min_move_pct = min_move_pct
+        self.reversal_history_minutes = history_minutes
+        for entry, value in (
+            (self.reversal_return_entry, return_pct),
+            (self.reversal_min_move_entry, min_move_pct),
+            (self.reversal_history_entry, history_minutes),
+        ):
+            entry.delete(0, "end")
+            entry.insert(0, f"{value:g}")
+        self._reversal_last_alert.clear()
+        self._apply_reversal_settings_to_scanner()
+        self._save_reversal_settings()
+        self._save_ui_settings()
+        self.status_var.set(
+            f"Вылет/вкат: возврат {return_pct:g}%, мин. вылет {min_move_pct:g}%, "
+            f"история {history_minutes:g}м — применено")
 
     def _clear_alert_log(self):
         rows = list(self._alert_rows) if self._alert_rows else list(self.log.get_children())
@@ -1895,24 +2456,36 @@ class App:
 
     # ---------------- старт/стоп ----------------
 
+    def _start_density_scanner(self):
+        self.scanner_running = True
+        exchanges_needed = {self.tree.item(k, "values")[0] for k in self.tree.get_children()}
+        for exch in exchanges_needed:
+            self._ensure_manager(exch)
+        for key in list(self.orderbooks.keys()):
+            exchange, symbol = key.split(":", 1)
+            self.orderbooks[key] = OrderBook(symbol)
+            threading.Thread(target=self._wait_and_subscribe,
+                              args=(exchange, symbol), daemon=True).start()
+        self.status_var.set("Сканер плотностей запущен, ждём топ движений")
+        if self._last_market_tickers:
+            self._sync_density_watchlist_from_movers(self._last_market_tickers, force=True)
+
+    def _stop_density_scanner(self):
+        self.scanner_running = False
+        for key in list(self._auto_density_keys):
+            self._remove_density_key(key)
+        self._density_sync_signature = None
+        for mgr in self.ws_managers.values():
+            mgr.stop()
+        self.ws_managers = {}
+        for exch in self.conn_labels:
+            self._update_conn_label(exch, "idle")
+
     def _toggle_start(self):
-        if not self.ws_managers:
-            exchanges_needed = {self.tree.item(k, "values")[0] for k in self.tree.get_children()}
-            for exch in exchanges_needed:
-                self._ensure_manager(exch)
-            self.start_btn.config(text="■ Стоп", bg="#dc2626")
-            for key in list(self.orderbooks.keys()):
-                exchange, symbol = key.split(":", 1)
-                self.orderbooks[key] = OrderBook(symbol)
-                threading.Thread(target=self._wait_and_subscribe,
-                                  args=(exchange, symbol), daemon=True).start()
+        if self.scanner_running:
+            self._stop_density_scanner()
         else:
-            for mgr in self.ws_managers.values():
-                mgr.stop()
-            self.ws_managers = {}
-            self.start_btn.config(text="▶ Старт", bg="#16a34a")
-            for exch in self.conn_labels:
-                self._update_conn_label(exch, "idle")
+            self._start_density_scanner()
 
     def _wait_and_subscribe(self, exchange, symbol):
         mgr = self.ws_managers.get(exchange)
@@ -2021,6 +2594,13 @@ class App:
                 self.event_queue.put(("HEDGEHOG_EVENTS", events))
         except Exception as e:
             dlog(f"hedgehog event scan error: {e!r}")
+        try:
+            candidates, stats, alerts = self._scan_reversal_background(tickers)
+            self.event_queue.put(("SPIKE_REVERSAL", candidates, stats))
+            if alerts:
+                self.event_queue.put(("SPIKE_REVERSAL_ALERTS", alerts))
+        except Exception as e:
+            dlog(f"spike reversal scan error: {e!r}")
 
     def _on_hedgehog_bootstrap_progress(self, stats):
         self.event_queue.put(("HEDGEHOG_BOOTSTRAP", stats))
@@ -2100,6 +2680,11 @@ class App:
                 elif kind == "HEDGEHOG_EVENTS":
                     for ev in item[1]:
                         self._render_hedgehog_event(ev)
+                elif kind == "SPIKE_REVERSAL":
+                    self._update_reversal_tree(item[1], item[2])
+                elif kind == "SPIKE_REVERSAL_ALERTS":
+                    for ev in item[1]:
+                        self._fire_reversal_alert(ev)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
@@ -2207,7 +2792,14 @@ class App:
 
     def _update_walls_tree(self, exchange, symbol, snapshot):
         key = f"{exchange}:{symbol}"
-        desired_iids = {f"{key}|{w['price']}" for w in snapshot}
+        self._wall_snapshots[key] = list(snapshot or [])
+        self._render_walls_snapshot(exchange, symbol, snapshot)
+
+    def _render_walls_snapshot(self, exchange, symbol, snapshot):
+        key = f"{exchange}:{symbol}"
+        filter_settings = self._read_active_wall_filter_settings(silent=True)
+        visible_snapshot = [w for w in (snapshot or []) if self._wall_passes_active_filters(w, filter_settings)]
+        desired_iids = {f"{key}|{w['price']}" for w in visible_snapshot}
         # снимаем только те строки ЭТОГО символа, которых больше нет в
         # снапшоте (плотность исчезла) — существующие НЕ трогаем, чтобы не
         # сбивать их позицию в таблице
@@ -2216,12 +2808,13 @@ class App:
                 self.walls_tree.delete(iid)
                 self._wall_row_seq.pop(iid, None)
 
-        for w in snapshot:
+        for w in visible_snapshot:
             iid = f"{key}|{w['price']}"
             side_ru = self._side_display(w["side"])
             if w.get("near_spread"):
                 side_ru = f"{side_ru}/у спреда"
-            values = (exchange, symbol, side_ru, f"{w['price']:g}", _format_compact_usd(w["usd"]),
+            symbol_display = self._symbol_display(exchange, symbol)
+            values = (exchange, symbol_display, side_ru, f"{w['price']:g}", _format_compact_usd(w["usd"]),
                       format_age(w["age"]), f"{w['dist_pct']:.2f}%")
             if self.walls_tree.exists(iid):
                 self.walls_tree.item(iid, values=values, tags=(w["side"],))
@@ -2240,19 +2833,235 @@ class App:
     # ---------------- топ движений рынка ----------------
 
     def _update_movers_trees(self, tickers):
-        # "Топ движений" показывает только MARKET_TOP_EXCHANGES (набор Codex,
-        # без spot и без MEXC/BYBIT). market_scanner при этом опрашивает шире
-        # (MARKET_SCAN_EXCHANGES: +MEXC +BYBIT) — эти данные нужны вкладке
-        # "Ранние", которой ниже передаётся ПОЛНЫЙ батч. MEXC мусорит микрокапами
-        # в топах, а BYBIT исключён из "Топ движений" по решению Codex.
-        movers = [t for t in tickers if t.get("exchange") in MARKET_TOP_EXCHANGES]
-        gainers, losers = MarketScanner.top_movers(movers, n=MARKET_TOP_N)
-        self._fill_movers_tree(self.gainers_tree, gainers, "up")
-        self._fill_movers_tree(self.losers_tree, losers, "down")
+        self._last_market_tickers = list(tickers or [])
+        movers = self._render_movers_only(self._last_market_tickers)
+        self._sync_density_watchlist_from_movers(self._last_market_tickers)
         # импульс — по тому же набору, что и таблицы: монета может дать импульс
         # за 3 мин, не будучи в топ-20 за сутки
         self._check_impulse_alerts(movers)
         self._update_early_tree(tickers)
+
+    def _top_mover_density_targets(self, tickers):
+        movers = [t for t in tickers or [] if t.get("exchange") in MARKET_TOP_EXCHANGES]
+        gainers, losers = self._top_grouped_movers(movers, n=MARKET_TOP_N)
+        by_symbol = {}
+
+        def consider(row, side):
+            primary = row.get("gain") if side == "up" else row.get("loss")
+            if not primary:
+                return
+            exchange = str(primary.get("exchange") or "").upper()
+            symbol = _normalize_symbol_input(primary.get("symbol") or row.get("symbol") or "", exchange)
+            if not exchange or not symbol:
+                return
+            score = abs(float(primary.get("change_pct_24h", 0.0) or 0.0))
+            current = by_symbol.get(symbol)
+            if current is None or score > current[2]:
+                by_symbol[symbol] = (exchange, symbol, score)
+
+        for row in gainers:
+            consider(row, "up")
+        for row in losers:
+            consider(row, "down")
+
+        targets = {}
+        for exchange, symbol, _score in by_symbol.values():
+            targets[f"{exchange}:{symbol}"] = (exchange, symbol)
+        for key in getattr(self, "_suppressed_auto_density_keys", set()):
+            targets.pop(key, None)
+        return targets
+
+    def _sync_density_watchlist_from_movers(self, tickers, force=False):
+        if not DENSITY_AUTO_ONLY:
+            return
+        if not self.scanner_running:
+            return
+        settings = self._read_density_filter_settings(silent=True)
+        if not settings:
+            return
+        targets = self._top_mover_density_targets(tickers)
+        signature = (
+            tuple(sorted(targets)),
+            self._density_filter_signature(settings),
+        )
+        if not force and signature == self._density_sync_signature:
+            return
+        self._density_sync_signature = signature
+
+        desired_keys = set(targets)
+        self._prune_loaded_density_keys(desired_keys)
+        for key in sorted(self._auto_density_keys - desired_keys):
+            self._remove_density_key(key)
+
+        for key, (exchange, symbol) in targets.items():
+            self._add_or_update_auto_density_key(exchange, symbol, settings)
+
+        self._auto_density_keys = desired_keys
+        self._save_ui_settings()
+        if desired_keys:
+            self.status_var.set(f"Сканер плотностей: {len(desired_keys)} пар из топа движений")
+        else:
+            self.status_var.set("Сканер плотностей: ждём список топ движений")
+
+    def _add_or_update_auto_density_key(self, exchange, symbol, settings):
+        key = f"{exchange}:{symbol}"
+        if key in getattr(self, "_suppressed_auto_density_keys", set()):
+            return
+        cfg = SymbolConfig(
+            symbol,
+            settings["threshold"],
+            "BOTH",
+            exchange=exchange,
+            mode="FIXED",
+            threshold_max_usd=settings["threshold_max"],
+            max_distance_pct=settings["max_distance_pct"],
+            single_confirm_sec=settings["single_confirm_sec"],
+        )
+        self.detector.set_config(cfg)
+
+        is_new = key not in self.orderbooks
+        if is_new:
+            self.orderbooks[key] = OrderBook(symbol)
+            self.muted_keys.add(key)
+
+        alerts_display = "🔇 Выкл" if key in self.muted_keys else "🔔 Вкл"
+        threshold_max_display = "-" if settings["threshold_max"] is None else (
+            _format_compact_usd(settings["threshold_max"]).replace("$", "")
+        )
+        values = (
+            exchange,
+            self._symbol_display(exchange, symbol),
+            "FIXED",
+            _format_compact_usd(settings["threshold"]).replace("$", ""),
+            "-",
+            "BOTH",
+            "-",
+            "-",
+            0,
+            alerts_display,
+            threshold_max_display,
+            f"{settings['max_distance_pct']:g}",
+            f"{settings['single_confirm_sec']:g}",
+        )
+        if self.tree.exists(key):
+            old = list(self.tree.item(key, "values"))
+            if len(old) >= 9:
+                values = (
+                    values[0], values[1], values[2], values[3],
+                    old[4], old[5], old[6], old[7], old[8],
+                    values[9], values[10], values[11], values[12],
+                )
+            self.tree.item(key, values=values)
+        else:
+            self.tree.insert("", "end", iid=key, values=values)
+            self._add_symbol_to_suggestions(self._symbol_display(exchange, symbol))
+
+        self._auto_density_keys.add(key)
+        if self.scanner_running and is_new:
+            self._ensure_manager(exchange)
+            threading.Thread(target=self._validate_and_subscribe,
+                             args=(exchange, symbol), daemon=True).start()
+
+    def _remove_density_key(self, key):
+        try:
+            exchange, symbol = key.split(":", 1)
+        except ValueError:
+            return
+        mgr = self.ws_managers.get(exchange)
+        if mgr and hasattr(mgr, "unsubscribe_symbol"):
+            try:
+                mgr.unsubscribe_symbol(symbol)
+            except Exception:
+                pass
+        self.detector.remove_symbol(exchange, symbol)
+        self.orderbooks.pop(key, None)
+        self.muted_keys.discard(key)
+        self._auto_density_keys.discard(key)
+        self._loaded_config_keys.discard(key)
+        self._wall_snapshots.pop(key, None)
+        if self.tree.exists(key):
+            self.tree.delete(key)
+        prefix = f"{key}|"
+        if hasattr(self, "walls_tree"):
+            for row in list(self.walls_tree.get_children()):
+                if str(row).startswith(prefix):
+                    self.walls_tree.delete(row)
+                    self._wall_row_seq.pop(row, None)
+
+    def _render_movers_only(self, tickers):
+        self._configure_movers_tree_headers()
+        exchange_set = MARKET_GROUPED_EXCHANGES if self._movers_symbol_view() else MARKET_TOP_EXCHANGES
+        movers = [t for t in tickers if t.get("exchange") in exchange_set]
+        if self._movers_symbol_view():
+            gainers, losers = self._top_grouped_movers(movers, n=MARKET_TOP_N)
+            self._fill_grouped_movers_tree(self.gainers_tree, gainers, "up")
+            self._fill_grouped_movers_tree(self.losers_tree, losers, "down")
+        else:
+            gainers, losers = MarketScanner.top_movers(movers, n=MARKET_TOP_N)
+            self._fill_movers_tree(self.gainers_tree, gainers, "up")
+            self._fill_movers_tree(self.losers_tree, losers, "down")
+        return movers
+
+    def _movers_symbol_view(self):
+        return self.movers_view_var.get() == MOVERS_VIEW_SYMBOL
+
+    def _toggle_movers_view(self):
+        if self._movers_symbol_view():
+            self.movers_view_var.set(MOVERS_VIEW_EXCHANGE)
+        else:
+            self.movers_view_var.set(MOVERS_VIEW_SYMBOL)
+        self._on_movers_view_changed()
+
+    def _update_movers_view_button(self):
+        if hasattr(self, "movers_view_btn"):
+            self.movers_view_btn.configure(text=self.movers_view_var.get())
+
+    def _on_movers_view_changed(self, _event=None):
+        if self._last_market_tickers:
+            self._render_movers_only(self._last_market_tickers)
+        else:
+            self._configure_movers_tree_headers()
+        self._update_movers_hint()
+        self._update_movers_view_button()
+        self._save_ui_settings()
+
+    def _layout_movers_tree_frames(self):
+        if not hasattr(self, "gainers_movers_frame"):
+            return
+        for frame in (self.gainers_movers_frame, self.losers_movers_frame):
+            frame.pack_forget()
+        self.gainers_movers_frame.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        self.losers_movers_frame.pack(side="left", fill="both", expand=True, padx=(0, 0))
+
+    def _configure_movers_tree_headers(self):
+        if not hasattr(self, "gainers_tree"):
+            return
+        if self._movers_symbol_view():
+            headers = {
+                "exchange": "Биржи", "symbol": "Монета", "last": "Цены",
+                "change": "24ч", "impulse": "Имп.",
+                "volume": "Объём",
+            }
+            widths = {"exchange": 0, "symbol": 135, "last": 0, "change": 85,
+                      "impulse": 90, "volume": 105}
+            displaycolumns = ("symbol", "change", "impulse", "volume")
+        else:
+            headers = {
+                "exchange": "Биржа", "symbol": "Символ", "last": "Цена",
+                "change": "24ч %", "impulse": self._impulse_column_title(),
+                "volume": "Объём $",
+            }
+            widths = {"exchange": 90, "symbol": 110, "last": 95, "change": 70,
+                      "impulse": 85, "volume": 95}
+            displaycolumns = ("exchange", "symbol", "last", "change", "impulse", "volume")
+        self._layout_movers_tree_frames()
+        for tree in (self.gainers_tree, self.losers_tree):
+            tree["displaycolumns"] = displaycolumns
+            for col, title in headers.items():
+                tree.heading(col, text=title)
+                tree.column(col, width=widths[col], minwidth=0 if widths[col] == 0 else 50,
+                            anchor="center", stretch=True)
+        self._update_movers_view_button()
 
     def _fill_movers_tree(self, tree, rows, default_tag):
         tree.delete(*tree.get_children())
@@ -2266,10 +3075,76 @@ class App:
             else:
                 tag = default_tag
             tree.insert("", "end", iid=key, values=(
-                r["exchange"], r["symbol"], f"{r['last']:g}",
+                r["exchange"], r["symbol"], _format_price(r["last"]),
                 f"{r['change_pct_24h']:+.2f}%", impulse_str,
                 _format_compact_usd(r["quote_volume"]),
             ), tags=(tag,))
+
+    def _top_grouped_movers(self, movers, n=MARKET_TOP_N):
+        order = {exchange: idx for idx, exchange in enumerate(MARKET_GROUPED_EXCHANGES)}
+        groups = {}
+        for item in movers:
+            symbol = item.get("symbol")
+            if not symbol:
+                continue
+            groups.setdefault(symbol, []).append(item)
+
+        rows = []
+        for symbol, items in groups.items():
+            items = sorted(items, key=lambda x: order.get(x.get("exchange"), 999))
+            gain = max(items, key=lambda x: float(x.get("change_pct_24h", 0.0) or 0.0))
+            loss = min(items, key=lambda x: float(x.get("change_pct_24h", 0.0) or 0.0))
+            rows.append({
+                "symbol": symbol,
+                "items": items,
+                "gain": gain,
+                "loss": loss,
+                "total_volume": sum(max(0.0, float(x.get("quote_volume", 0.0) or 0.0)) for x in items),
+            })
+        gainers = sorted(rows, key=lambda x: float(x["gain"].get("change_pct_24h", 0.0) or 0.0),
+                         reverse=True)[:n]
+        losers = sorted(rows, key=lambda x: float(x["loss"].get("change_pct_24h", 0.0) or 0.0))[:n]
+        return gainers, losers
+
+    def _fill_grouped_movers_tree(self, tree, rows, default_tag):
+        tree.delete(*tree.get_children())
+        for row in rows:
+            primary = row["gain"] if default_tag == "up" else row["loss"]
+            impulse_item = max(row["items"], key=lambda x: abs(float(x.get("impulse_pct", 0.0) or 0.0)))
+            impulse = float(impulse_item.get("impulse_pct", 0.0) or 0.0)
+            impulse_str = f"{impulse:+.2f}%"
+            tag = default_tag
+            if abs(impulse) >= self.impulse_threshold_pct:
+                impulse_str = f"⚡ {impulse_str}"
+                tag = "impulse"
+            key = f"SYMBOL:{default_tag}:{row['symbol']}"
+            tree.insert("", "end", iid=key, values=(
+                self._format_grouped_exchanges(row["items"]),
+                row["symbol"],
+                self._format_grouped_prices(row["items"]),
+                f"{float(primary.get('change_pct_24h', 0.0) or 0.0):+.2f}%",
+                impulse_str,
+                self._format_grouped_volume(row),
+            ), tags=(tag,))
+
+    def _exchange_short(self, exchange):
+        return EXCHANGE_SHORT_LABELS.get(exchange, exchange or "")
+
+    def _format_grouped_exchanges(self, items):
+        return "/".join(self._exchange_short(item.get("exchange")) for item in items)
+
+    def _format_grouped_prices(self, items):
+        parts = [
+            f"{self._exchange_short(item.get('exchange'))} {_format_price(item.get('last'))}"
+            for item in items
+        ]
+        if len(parts) <= 4:
+            return " / ".join(parts)
+        return " / ".join(parts[:4]) + f" / +{len(parts) - 4}"
+
+    def _format_grouped_volume(self, row):
+        total = row.get("total_volume", 0.0)
+        return _format_compact_usd(total)
 
     # ---------------- настройка/алерты импульса ----------------
 
@@ -2278,10 +3153,14 @@ class App:
         return f"Импульс {int(w / 60)}м" if w >= 60 else f"Импульс {int(w)}с"
 
     def _update_movers_hint(self):
+        if self._movers_symbol_view():
+            click_hint = "Двойной клик: добавить монету на все биржи."
+        else:
+            click_hint = "Двойной клик: добавить выбранную биржу."
         self.movers_hint_var.set(
-            f"Обновляется раз в {int(MARKET_POLL_INTERVAL_SEC)}с. "
-            f"⚡ = импульс {self.impulse_threshold_pct:g}%+ за {self._impulse_column_title().split(' ', 1)[1]}. "
-            "Двойной клик — добавить в сканер (режим AUTO)."
+            f"Обновление {int(MARKET_POLL_INTERVAL_SEC)}с. "
+            f"⚡ {self.impulse_threshold_pct:g}%+ за {self._impulse_column_title().split(' ', 1)[1]}. "
+            f"{click_hint}"
         )
 
     def _apply_impulse_settings(self):
@@ -2303,9 +3182,7 @@ class App:
         self.impulse_window_sec = window_sec
         self.market_scanner.impulse_window_sec = window_sec
         self._impulse_above.clear()  # порог/окно сменились — забываем прежнее состояние "выше/ниже"
-        title = self._impulse_column_title()
-        self.gainers_tree.heading("impulse", text=title)
-        self.losers_tree.heading("impulse", text=title)
+        self._configure_movers_tree_headers()
         self._update_movers_hint()
         self._save_impulse_settings()
         self._save_ui_settings()
@@ -2319,8 +3196,8 @@ class App:
                 data = json.load(f)
             self.impulse_threshold_pct = float(data.get("threshold_pct", self.impulse_threshold_pct))
             self.impulse_window_sec = float(data.get("window_sec", self.impulse_window_sec))
-            self.impulse_popup_enabled.set(bool(data.get("popup_enabled", True)))
-            self.impulse_sound_enabled.set(bool(data.get("sound_enabled", True)))
+            self.impulse_popup_enabled.set(bool(data.get("popup_enabled", DEFAULT_NOTIFICATIONS_ENABLED)))
+            self.impulse_sound_enabled.set(bool(data.get("sound_enabled", DEFAULT_NOTIFICATIONS_ENABLED)))
         except Exception:
             pass
 
@@ -2419,8 +3296,8 @@ class App:
         try:
             with open(HEDGEHOG_EVENT_SETTINGS_FILE, encoding="utf-8") as f:
                 data = json.load(f)
-            self.hedgehog_event_popup_enabled.set(bool(data.get("popup_enabled", True)))
-            self.hedgehog_event_sound_enabled.set(bool(data.get("sound_enabled", True)))
+            self.hedgehog_event_popup_enabled.set(bool(data.get("popup_enabled", DEFAULT_NOTIFICATIONS_ENABLED)))
+            self.hedgehog_event_sound_enabled.set(bool(data.get("sound_enabled", DEFAULT_NOTIFICATIONS_ENABLED)))
         except Exception:
             pass
 
@@ -2573,6 +3450,167 @@ class App:
                 parts.append(f"история {HEDGEHOG_BOOTSTRAP_HOURS:g}ч загружена: {seeded}/{total}, ошибок {errors}")
 
         self.hedgehog_event_status_var.set(" | ".join(parts))
+
+    def _allowed_reversal_sides(self):
+        vars_map = getattr(self, "reversal_filter_vars", {})
+        sides = [kind for kind, _label in SPIKE_REVERSAL_FILTERS
+                 if vars_map.get(kind) is None or vars_map[kind].get()]
+        return sides or []
+
+    def _scan_reversal_background(self, tickers):
+        candidates = MarketScanner.spike_reversal_candidates(
+            tickers,
+            n=SPIKE_REVERSAL_MAX_ROWS,
+            exchanges=SPIKE_REVERSAL_EXCHANGES,
+            min_count=SPIKE_REVERSAL_MIN_COUNT,
+            sides=("down", "up"),
+        )
+        stats = self._make_reversal_scan_stats(tickers, candidates)
+        alerts = self._fresh_reversal_alerts(candidates)
+        return candidates, stats, alerts
+
+    def _make_reversal_scan_stats(self, tickers, candidates):
+        relevant = [t for t in tickers if t.get("exchange") in SPIKE_REVERSAL_EXCHANGES]
+        ready = [t for t in relevant if t.get("rev_ready")]
+        with_events = [t for t in ready if int(t.get("rev_count", 0) or 0) > 0]
+        max_samples = max((int(t.get("rev_samples", 0) or 0) for t in relevant), default=0)
+        return {
+            "relevant": len(relevant),
+            "ready": len(ready),
+            "with_events": len(with_events),
+            "candidates": len(candidates),
+            "max_samples": max_samples,
+            "ts": time.time(),
+        }
+
+    def _fresh_reversal_alerts(self, candidates):
+        now = time.time()
+        alerts = []
+        for t in candidates:
+            last_ts = float(t.get("rev_last_ts", 0.0) or 0.0)
+            if now - last_ts > SPIKE_REVERSAL_FRESH_SEC:
+                continue
+            alerts.append(dict(t))
+        return alerts
+
+    def _format_reversal_when(self, ts):
+        if not ts:
+            return "—"
+        age = max(0.0, time.time() - float(ts))
+        if age < 90:
+            return f"{int(age)}с назад"
+        if age < 3600:
+            return f"{int(age // 60)}м назад"
+        return datetime.fromtimestamp(float(ts)).strftime("%H:%M")
+
+    def _format_reversal_duration(self, sec):
+        sec = max(0.0, float(sec or 0.0))
+        if sec < 60:
+            return f"{sec:.0f}с"
+        return f"{sec / 60.0:.1f}м"
+
+    def _update_reversal_tree(self, candidates, stats):
+        if not hasattr(self, "reversal_tree"):
+            return
+        self._reversal_scan_stats = stats or {}
+        self._last_reversal_candidates = list(candidates or [])
+        self.reversal_tree.delete(*self.reversal_tree.get_children())
+        self._reversal_rows.clear()
+        for idx, c in enumerate(candidates[:SPIKE_REVERSAL_MAX_ROWS]):
+            side = c.get("rev_last_side", "")
+            if side not in self._allowed_reversal_sides():
+                continue
+            down = int(c.get("rev_down_count", 0) or 0)
+            up = int(c.get("rev_up_count", 0) or 0)
+            details = f"вниз {down}, вверх {up}; лучший {c.get('rev_best_move_pct', 0.0):.2f}%"
+            iid = f"reversal-{idx}-{c.get('exchange')}:{c.get('symbol')}"
+            self.reversal_tree.insert("", "end", iid=iid, values=(
+                c.get("exchange", ""),
+                c.get("symbol", ""),
+                SPIKE_REVERSAL_LABELS.get(side, side),
+                c.get("rev_count", 0),
+                f"{c.get('last', c.get('rev_last_price', 0.0)):g}",
+                f"{c.get('rev_last_move_pct', 0.0):.2f}%",
+                f"{c.get('rev_avg_move_pct', 0.0):.2f}%",
+                f"{c.get('rev_last_return_pct', 0.0):.0f}%",
+                self._format_reversal_duration(c.get("rev_last_duration_sec", 0.0)),
+                self._format_reversal_when(c.get("rev_last_ts", 0.0)),
+                details,
+            ), tags=(side,))
+            self._reversal_rows.append(iid)
+        self._update_reversal_status()
+
+    def _update_reversal_status(self):
+        if not hasattr(self, "reversal_status_var"):
+            return
+        stats = self._reversal_scan_stats or {}
+        relevant = int(stats.get("relevant", 0) or 0)
+        ready = int(stats.get("ready", 0) or 0)
+        max_samples = int(stats.get("max_samples", 0) or 0)
+        if relevant and ready >= relevant:
+            warmup = f"прогрето {ready}/{relevant}"
+        else:
+            warmup = f"прогрев {min(max_samples, SPIKE_REVERSAL_MIN_COUNT * 3)}/{SPIKE_REVERSAL_MIN_COUNT * 3}"
+        sides = self._allowed_reversal_sides()
+        side_text = ", ".join(SPIKE_REVERSAL_LABELS.get(s, s).lower() for s in sides) or "всё скрыто фильтрами"
+        self.reversal_status_var.set(
+            f"{warmup} | с вылетами: {int(stats.get('with_events', 0) or 0)} | "
+            f"повторов {SPIKE_REVERSAL_MIN_COUNT}+: {int(stats.get('candidates', 0) or 0)} | "
+            f"возврат {self.reversal_return_pct:g}%+, вылет {self.reversal_min_move_pct:g}%+, "
+            f"история {self.reversal_history_minutes:g}м | фильтр: {side_text}")
+
+    def _fire_reversal_alert(self, ticker):
+        side = ticker.get("rev_last_side", "")
+        if side not in self._allowed_reversal_sides():
+            return
+        key = f"{ticker.get('exchange')}:{ticker.get('symbol')}:{side}"
+        now = time.time()
+        if now - self._reversal_last_alert.get(key, 0.0) < SPIKE_REVERSAL_REALERT_SEC:
+            return
+        if not (self.reversal_popup_enabled.get() or self.reversal_sound_enabled.get()):
+            return
+        self._reversal_last_alert[key] = now
+        if self.reversal_popup_enabled.get():
+            self._show_reversal_toast(ticker)
+        if self.reversal_sound_enabled.get():
+            threading.Thread(target=_play_beep, args=("SPIKE_REVERSAL",), daemon=True).start()
+
+    def _show_reversal_toast(self, ticker):
+        side = ticker.get("rev_last_side", "")
+        color = SPIKE_REVERSAL_COLORS.get(side, EVENT_COLORS["CASCADE"])
+        symbol = ticker.get("symbol", "")
+        exchange = ticker.get("exchange", "")
+
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        toast.configure(bg=color)
+        inner = tk.Frame(toast, bg="#1f1f24")
+        inner.pack(fill="both", expand=True, padx=2, pady=2)
+        tk.Label(inner, text=f"Вылет/вкат: {SPIKE_REVERSAL_LABELS.get(side, side)}",
+                 bg="#1f1f24", fg=color, font=("Segoe UI", 10, "bold"),
+                 anchor="w").pack(fill="x", padx=10, pady=(8, 0))
+        detail = (
+            f"{exchange}  {symbol}   повторов {ticker.get('rev_count', 0)}   "
+            f"{ticker.get('rev_last_move_pct', 0.0):.2f}% -> {ticker.get('rev_last_return_pct', 0.0):.0f}%"
+        )
+        tk.Label(inner, text=detail, bg="#1f1f24", fg="white",
+                 font=("Segoe UI", 9), anchor="w").pack(fill="x", padx=10, pady=(0, 8))
+
+        def _on_click(_event=None):
+            self.notebook.select(self.tab_reversal)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(symbol)
+            self.status_var.set(f"Вылет/вкат: {symbol} скопирован в буфер")
+            self._remove_impulse_toast(toast)
+
+        toast.bind("<Button-1>", _on_click)
+        for w in (inner, *inner.winfo_children()):
+            w.bind("<Button-1>", _on_click)
+
+        self._active_impulse_toasts.append(toast)
+        self._reposition_impulse_toasts()
+        toast.after(IMPULSE_TOAST_MS, lambda: self._remove_impulse_toast(toast))
 
     def _get_hedgehog_book_confirmation(self, ticker):
         key = f"{ticker.get('exchange')}:{ticker.get('symbol')}"
@@ -2867,6 +3905,13 @@ class App:
         if not sel:
             return
         key = sel[0]
+        vals = tree.item(key, "values")
+        if self._movers_symbol_view() or key.startswith("SYMBOL:"):
+            if len(vals) < 2:
+                return
+            symbol = self._symbol_from_display(vals[1])
+            self._add_mover_symbol_all_exchanges(symbol)
+            return
         exchange, symbol = key.split(":", 1)
         # добавляем через тот же путь, что кнопка "Добавить" — заполняем поля
         # и вызываем _add_symbol(), чтобы не дублировать валидацию/подписку
@@ -2886,6 +3931,35 @@ class App:
         self.root.clipboard_clear()
         self.root.clipboard_append(symbol)
         self.status_var.set(f"Добавлено в сканер (AUTO) и скопировано в буфер: {exchange}:{symbol}")
+        self.notebook.select(self.tab_scanner)
+
+    def _add_mover_symbol_all_exchanges(self, symbol):
+        self.exchange_combo.set(ALL_EXCHANGES_LABEL)
+        self.symbol_entry.delete(0, "end")
+        self.symbol_entry.insert(0, symbol)
+        self.mode_combo.set("AUTO")
+        self.volume_preset_combo.set("Вручную")
+        self.threshold_entry.delete(0, "end")
+        self.threshold_entry.insert(0, str(MOVER_ADD_DEFAULT_FLOOR))
+        self.threshold_max_entry.delete(0, "end")
+        self.max_distance_entry.delete(0, "end")
+        self.max_distance_entry.insert(0, str(DEFAULT_MAX_DISTANCE_PCT))
+        self.single_confirm_entry.delete(0, "end")
+        self.single_confirm_entry.insert(0, str(DEFAULT_SINGLE_CONFIRM_SEC))
+        self._add_symbol_all_exchanges(
+            symbol,
+            MOVER_ADD_DEFAULT_FLOOR,
+            None,
+            "BOTH",
+            "AUTO",
+            DEFAULT_MAX_DISTANCE_PCT,
+            DEFAULT_SINGLE_CONFIRM_SEC,
+            exchanges=EXCHANGE_CHOICES,
+            target_label="всех биржах",
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(symbol)
+        self.status_var.set(f"Проверяю {symbol} на всех биржах и добавляю в сканер (AUTO)")
         self.notebook.select(self.tab_scanner)
 
     # ---------------- ранние кандидаты (живая тишина) ----------------
@@ -3013,12 +4087,54 @@ class App:
 
     # ---------------- сохранение конфига ----------------
 
+    def _serialize_last_density_targets(self):
+        targets = []
+        for key in sorted(getattr(self, "_auto_density_keys", set())):
+            try:
+                exchange, symbol = key.split(":", 1)
+            except ValueError:
+                continue
+            targets.append({"exchange": exchange, "symbol": symbol})
+        return targets
+
+    def _load_last_density_targets(self):
+        if not DENSITY_AUTO_ONLY:
+            return
+        values = self._ui_settings.get("last_density_targets", []) if isinstance(self._ui_settings, dict) else []
+        if not isinstance(values, list):
+            return
+        settings = self._read_density_filter_settings(silent=True)
+        if not settings:
+            return
+        desired = set()
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            exchange = str(item.get("exchange") or "").upper()
+            symbol = _normalize_symbol_input(item.get("symbol") or "", exchange)
+            if not exchange or not symbol or exchange not in EXCHANGE_CHOICES:
+                continue
+            key = f"{exchange}:{symbol}"
+            if key in self._suppressed_auto_density_keys:
+                continue
+            self._add_or_update_auto_density_key(exchange, symbol, settings)
+            desired.add(key)
+        self._auto_density_keys = desired
+        if desired:
+            self._density_sync_signature = None
+
+    def _prune_loaded_density_keys(self, desired_keys):
+        for key in sorted(self._loaded_config_keys - set(desired_keys or ())):
+            self._remove_density_key(key)
+
     def _build_config_data(self):
         """Собирает текущий список монет из таблицы в список dict — общий
         источник и для обычного автосохранения (_save_config), и для
         экспорта в произвольный файл (_export_config)."""
         data = []
         for key in self.tree.get_children():
+            if key in self._auto_density_keys:
+                continue
             vals = self.tree.item(key, "values")
             tmax_raw = vals[10] if len(vals) > 10 else "-"
             threshold_max = None
@@ -3050,7 +4166,7 @@ class App:
             })
         return data
 
-    def _apply_config_data(self, data):
+    def _apply_config_data(self, data, track_loaded=False):
         """Добавляет монеты из списка dict (тот же формат, что и в
         config.json) через обычный _add_symbol — общий код для загрузки при
         старте (_load_config) и для импорта из произвольного файла
@@ -3063,11 +4179,14 @@ class App:
                     self._add_symbol(item["symbol"], item["threshold"], item["direction"],
                                       exchange=exchange,
                                       mode=item.get("mode", "FIXED"),
-                                      muted=item.get("muted", False), silent=True,
+                                      muted=item.get("muted", DEFAULT_DENSITY_ALERTS_MUTED), silent=True,
                                       threshold_max=item.get("threshold_max"),
                                       max_distance_pct=item.get("max_distance_pct"),
                                       single_confirm_sec=item.get("single_confirm_sec"),
                                       exact_exchange=True)
+                    key = f"{exchange}:{_normalize_symbol_input(item.get('symbol', ''), exchange)}"
+                    if track_loaded and key in self.orderbooks:
+                        self._loaded_config_keys.add(key)
                     count += 1
             except Exception:
                 continue
@@ -3079,12 +4198,14 @@ class App:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
     def _load_config(self):
+        if DENSITY_AUTO_ONLY:
+            return
         if not os.path.exists(CONFIG_FILE):
             return
         try:
             with open(CONFIG_FILE, encoding="utf-8") as f:
                 data = json.load(f)
-            self._apply_config_data(data)
+            self._apply_config_data(data, track_loaded=True)
         except Exception:
             pass
 
@@ -3128,6 +4249,15 @@ class App:
             messagebox.showerror("Ошибка импорта", f"Не удалось прочитать файл:\n{e}")
 
     def _on_close(self):
+        if self.tmm_cutter is not None:
+            try:
+                self.tmm_cutter.save_on_exit()
+            except Exception as error:
+                dlog(f"TMM Cutter shutdown failed: {error!r}")
+                try:
+                    self.tmm_cutter.shutdown_background_services()
+                except Exception:
+                    pass
         self.audit_writer.stop()
         for mgr in self.ws_managers.values():
             mgr.stop()
@@ -3138,5 +4268,6 @@ class App:
         self._save_impulse_settings()
         self._save_print_settings()
         self._save_hedgehog_event_settings()
+        self._save_reversal_settings()
         self._save_ui_settings()
         self.root.destroy()

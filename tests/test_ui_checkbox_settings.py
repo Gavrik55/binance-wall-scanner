@@ -17,12 +17,14 @@ guimod.UI_SETTINGS_FILE = os.path.join(tmp, "test_ui_checkbox_settings.json")
 guimod.IMPULSE_SETTINGS_FILE = os.path.join(tmp, "test_ui_impulse_settings.json")
 guimod.HEDGEHOG_EVENT_SETTINGS_FILE = os.path.join(tmp, "test_ui_hedgehog_event_settings.json")
 guimod.PRINT_SETTINGS_FILE = os.path.join(tmp, "test_ui_print_settings.json")
+guimod.SPIKE_REVERSAL_SETTINGS_FILE = os.path.join(tmp, "test_ui_spike_reversal_settings.json")
 for path in (
     guimod.CONFIG_FILE,
     guimod.UI_SETTINGS_FILE,
     guimod.IMPULSE_SETTINGS_FILE,
     guimod.HEDGEHOG_EVENT_SETTINGS_FILE,
     guimod.PRINT_SETTINGS_FILE,
+    guimod.SPIKE_REVERSAL_SETTINGS_FILE,
 ):
     if os.path.exists(path):
         os.remove(path)
@@ -37,9 +39,13 @@ app.early_alerts_enabled.set(False)
 app.early_exclusive_only.set(False)
 app.hedgehog_event_popup_enabled.set(False)
 app.hedgehog_event_sound_enabled.set(False)
+app.reversal_popup_enabled.set(False)
+app.reversal_sound_enabled.set(False)
+app.movers_view_var.set(guimod.MOVERS_VIEW_SYMBOL)
 app.alert_filter_vars["APPEARED"].set(False)
 app.alert_filter_vars["PUSH"].set(False)
 app.hedgehog_event_filter_vars["HEDGEHOG_BOOK"].set(False)
+app.reversal_filter_vars["up"].set(False)
 app._save_ui_settings()
 app._on_close()
 print("OK: первая сессия сохранила ui_settings.json")
@@ -53,11 +59,16 @@ assert app2.early_alerts_enabled.get() is False
 assert app2.early_exclusive_only.get() is False
 assert app2.hedgehog_event_popup_enabled.get() is False
 assert app2.hedgehog_event_sound_enabled.get() is False
+assert app2.reversal_popup_enabled.get() is False
+assert app2.reversal_sound_enabled.get() is False
+assert app2.movers_view_var.get() == guimod.MOVERS_VIEW_SYMBOL
 assert app2.alert_filter_vars["APPEARED"].get() is False
 assert app2.alert_filter_vars["PUSH"].get() is False
 assert app2.alert_filter_vars["MAGNET"].get() is True
 assert app2.hedgehog_event_filter_vars["HEDGEHOG_BOOK"].get() is False
 assert app2.hedgehog_event_filter_vars["HEDGEHOG_NEEDLES"].get() is True
+assert app2.reversal_filter_vars["up"].get() is False
+assert app2.reversal_filter_vars["down"].get() is True
 print("OK: вторая сессия восстановила состояния всех основных галочек")
 
 app2.alert_filter_vars["APPEARED"].set(True)

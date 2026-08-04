@@ -43,4 +43,9 @@ assert gui._parse_compact_usd("10,000") == 10_000
 assert gui._parse_compact_usd("10,5к") == 10_500
 print("OK: compact USD formatting/parsing works")
 
+assert gui._format_price(63023) == "63,023"
+assert gui._format_price(1.23456789) == "1.234568"
+assert gui._format_price(0.00001234) == "0.00001234"
+print("OK: price formatting avoids scientific notation")
+
 print("\nALL SYMBOL NORMALIZE / COMPACT TESTS PASSED")

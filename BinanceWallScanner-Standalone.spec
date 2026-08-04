@@ -20,12 +20,15 @@ TKINTER_BINARIES = [
     (os.path.join(DLLS_DIR, '_tkinter.pyd'), '.'),
     (os.path.join(DLLS_DIR, 'tcl86t.dll'), '.'),
     (os.path.join(DLLS_DIR, 'tk86t.dll'), '.'),
+    (r'C:\TMM_Cutter\ffmpeg.exe', '.'),
 ]
 TKINTER_DATAS = [
     (TKINTER_DIR, 'tkinter'),
     (TCL_DIR, '_tcl_data'),
     (TK_DIR, '_tk_data'),
     ('sounds', 'sounds'),
+    ('assets', 'assets'),
+    ('custom_logic.py', '.'),
 ]
 
 
@@ -57,6 +60,7 @@ exe = EXE(
     a.datas,
     [],
     name='BinanceWallScanner-Standalone',
+    icon='assets\\merged_project_icon.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

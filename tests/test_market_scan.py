@@ -3,6 +3,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import market_scan
 
+assert market_scan._okx_quote_volume({"volCcy24h": "100"}, 10.0, "SWAP") == 1000.0
+assert market_scan._okx_quote_volume({"volCcy24h": "1000"}, 10.0, "SPOT") == 1000.0
+print("OK: OKX futures volume converts from coin volume to USDT; spot volume stays quote volume")
+
 print("--- fetching each exchange individually ---")
 for exch, fetch in market_scan.FETCHERS.items():
     data = fetch()

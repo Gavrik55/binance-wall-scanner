@@ -50,10 +50,16 @@ if exist "dist\BinanceWallScanner\config.json" copy /Y "dist\BinanceWallScanner\
 if exist "dist\BinanceWallScanner\impulse_settings.json" copy /Y "dist\BinanceWallScanner\impulse_settings.json" "%BACKUP_DIR%\impulse_settings.json" >nul
 if exist "dist\BinanceWallScanner\print_settings.json" copy /Y "dist\BinanceWallScanner\print_settings.json" "%BACKUP_DIR%\print_settings.json" >nul
 if exist "dist\BinanceWallScanner\ui_settings.json" copy /Y "dist\BinanceWallScanner\ui_settings.json" "%BACKUP_DIR%\ui_settings.json" >nul
+if exist "dist\BinanceWallScanner\hedgehog_event_settings.json" copy /Y "dist\BinanceWallScanner\hedgehog_event_settings.json" "%BACKUP_DIR%\hedgehog_event_settings.json" >nul
+if exist "dist\BinanceWallScanner\spike_reversal_settings.json" copy /Y "dist\BinanceWallScanner\spike_reversal_settings.json" "%BACKUP_DIR%\spike_reversal_settings.json" >nul
 if exist "dist\config.json" copy /Y "dist\config.json" "%BACKUP_DIR%\dist-config.json" >nul
 if exist "dist\impulse_settings.json" copy /Y "dist\impulse_settings.json" "%BACKUP_DIR%\dist-impulse_settings.json" >nul
 if exist "dist\print_settings.json" copy /Y "dist\print_settings.json" "%BACKUP_DIR%\dist-print_settings.json" >nul
 if exist "dist\ui_settings.json" copy /Y "dist\ui_settings.json" "%BACKUP_DIR%\dist-ui_settings.json" >nul
+if exist "dist\hedgehog_event_settings.json" copy /Y "dist\hedgehog_event_settings.json" "%BACKUP_DIR%\dist-hedgehog_event_settings.json" >nul
+if exist "dist\spike_reversal_settings.json" copy /Y "dist\spike_reversal_settings.json" "%BACKUP_DIR%\dist-spike_reversal_settings.json" >nul
+if exist "dist\BinanceWallScanner\tmm_cutter_data" xcopy /E /I /Y "dist\BinanceWallScanner\tmm_cutter_data" "%BACKUP_DIR%\tmm_cutter_data" >nul
+if exist "dist\tmm_cutter_data" xcopy /E /I /Y "dist\tmm_cutter_data" "%BACKUP_DIR%\dist-tmm_cutter_data" >nul
 
 if defined SKIP_PIP (
     echo.
@@ -84,10 +90,18 @@ if exist "%BACKUP_DIR%\config.json" copy /Y "%BACKUP_DIR%\config.json" "dist\Bin
 if exist "%BACKUP_DIR%\impulse_settings.json" copy /Y "%BACKUP_DIR%\impulse_settings.json" "dist\BinanceWallScanner\impulse_settings.json" >nul
 if exist "%BACKUP_DIR%\print_settings.json" copy /Y "%BACKUP_DIR%\print_settings.json" "dist\BinanceWallScanner\print_settings.json" >nul
 if exist "%BACKUP_DIR%\ui_settings.json" copy /Y "%BACKUP_DIR%\ui_settings.json" "dist\BinanceWallScanner\ui_settings.json" >nul
+if exist "%BACKUP_DIR%\hedgehog_event_settings.json" copy /Y "%BACKUP_DIR%\hedgehog_event_settings.json" "dist\BinanceWallScanner\hedgehog_event_settings.json" >nul
+if exist "%BACKUP_DIR%\spike_reversal_settings.json" copy /Y "%BACKUP_DIR%\spike_reversal_settings.json" "dist\BinanceWallScanner\spike_reversal_settings.json" >nul
 if exist "%BACKUP_DIR%\dist-config.json" copy /Y "%BACKUP_DIR%\dist-config.json" "dist\config.json" >nul
 if exist "%BACKUP_DIR%\dist-impulse_settings.json" copy /Y "%BACKUP_DIR%\dist-impulse_settings.json" "dist\impulse_settings.json" >nul
 if exist "%BACKUP_DIR%\dist-print_settings.json" copy /Y "%BACKUP_DIR%\dist-print_settings.json" "dist\print_settings.json" >nul
 if exist "%BACKUP_DIR%\dist-ui_settings.json" copy /Y "%BACKUP_DIR%\dist-ui_settings.json" "dist\ui_settings.json" >nul
+if exist "%BACKUP_DIR%\dist-hedgehog_event_settings.json" copy /Y "%BACKUP_DIR%\dist-hedgehog_event_settings.json" "dist\hedgehog_event_settings.json" >nul
+if exist "%BACKUP_DIR%\dist-spike_reversal_settings.json" copy /Y "%BACKUP_DIR%\dist-spike_reversal_settings.json" "dist\spike_reversal_settings.json" >nul
+if exist "%BACKUP_DIR%\tmm_cutter_data" xcopy /E /I /Y "%BACKUP_DIR%\tmm_cutter_data" "dist\BinanceWallScanner\tmm_cutter_data" >nul
+if exist "%BACKUP_DIR%\dist-tmm_cutter_data" xcopy /E /I /Y "%BACKUP_DIR%\dist-tmm_cutter_data" "dist\tmm_cutter_data" >nul
+if not exist "dist\BinanceWallScanner\tmm_cutter_data" if exist "tmm_cutter_data" xcopy /E /I /Y "tmm_cutter_data" "dist\BinanceWallScanner\tmm_cutter_data" >nul
+if not exist "dist\tmm_cutter_data" if exist "tmm_cutter_data" xcopy /E /I /Y "tmm_cutter_data" "dist\tmm_cutter_data" >nul
 
 if exist "%BACKUP_DIR%" rmdir /S /Q "%BACKUP_DIR%"
 
