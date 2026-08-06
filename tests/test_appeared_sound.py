@@ -1,5 +1,21 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import types
+
+try:
+    import requests  # noqa: F401
+except ModuleNotFoundError:
+    fake_requests = types.ModuleType("requests")
+    fake_requests.get = lambda *_args, **_kwargs: None
+    sys.modules["requests"] = fake_requests
+
+try:
+    import websockets  # noqa: F401
+except ModuleNotFoundError:
+    fake_websockets = types.ModuleType("websockets")
+    fake_websockets.connect = None
+    sys.modules["websockets"] = fake_websockets
+
 import gui as guimod
 import winsound
 

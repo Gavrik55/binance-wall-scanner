@@ -55,12 +55,12 @@ ob2 = make_ob_usd({1.00: 50_000, 1.03: 50_000, 1.06: 50_000})  # ~3% между 
 events2 = age_and_rescan(det2, ob2)
 walls2 = [e for e in events2 if e.kind == "WALL"]
 assert len(walls2) == 1, f"3 плотности по 50к рядом -> должна быть 1 стенка, получено {len(walls2)}"
-print("OK: 3 плотности по $50,000 рядом -> СТЕНКА:", walls2[0].extra)
+print("OK: 3 плотности по $50к рядом -> СТЕНКА:", walls2[0].extra)
 
-# --- 3) подгруппа внутри одного price-кластера: 3×50к + 2×100к вперемешку по цене ---
+# --- 3) подгруппа внутри одного price-кластера: 3x50к + 2x100к вперемешку по цене ---
 # (100к-50к=50к > допуска 30к — реально разные группы, в отличие от 75к из
 # более ранней версии теста, которая теперь закономерно сливается с 50к)
-# ожидаем стенку из 3×50к (набрала кворум), а 2×100к - нет (не хватило до wall_min_components=3)
+# ожидаем стенку из 3x50к (набрала кворум), а 2x100к - нет (не хватило до wall_min_components=3)
 det3 = new_detector()
 prime(det3)
 ob3 = make_ob_usd({
@@ -68,9 +68,9 @@ ob3 = make_ob_usd({
 })
 events3 = age_and_rescan(det3, ob3)
 walls3 = [e for e in events3 if e.kind == "WALL"]
-assert len(walls3) == 1, f"должна найтись ровно 1 стенка (3×50к), получено {len(walls3)}"
-assert "3 плотности" in walls3[0].extra and "50,000" in walls3[0].extra, walls3[0].extra
-print("OK: подгруппа 3×50к внутри смешанного price-кластера найдена корректно:", walls3[0].extra)
+assert len(walls3) == 1, f"должна найтись ровно 1 стенка (3x50к), получено {len(walls3)}"
+assert "3 плотности" in walls3[0].extra and "50к" in walls3[0].extra, walls3[0].extra
+print("OK: подгруппа 3x50к внутри смешанного price-кластера найдена корректно:", walls3[0].extra)
 
 # --- 4) минимум участников по-прежнему настраиваемый (3 по умолчанию) ---
 det4 = new_detector(wall_min_components=3)

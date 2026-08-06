@@ -1,39 +1,58 @@
-# Python cache and test artifacts
+# --- Python ---
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 htmlcov/
 
-# Virtual environments and local dependency folders
+# --- Virtual environments ---
 .venv/
 venv/
 env/
 ENV/
 
-# PyInstaller build output
+# --- Build output ---
 build/
 dist/
-
-# Packaged binaries and runtime files
+dist-versioned/
 *.exe
+.build_config_backup/
+
+# --- Local user/runtime files ---
+config.json
+impulse_settings.json
+print_settings.json
+ui_settings.json
+hedgehog_event_settings.json
+spike_reversal_settings.json
+wall_scanner_config*.json
+
+# --- Recorded data and logs ---
+depth_data/
+debug_packs/
+audit_logs/
+tmm_cutter_data/
 debug.log
 *.log
-impulse_settings.json
 
-# Local editor and OS files
+# --- Screenshots / images ---
+*.png
+*.jpg
+*.jpeg
+*.gif
+screen-check-*.png
+
+# --- Editors / OS / temporary files ---
 .idea/
 .vscode/
 *.swp
 *.swo
+*.bak
+*.tmp
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Temporary exported configs/backups
-wall_scanner_config*.json
-*.bak
-*.tmp

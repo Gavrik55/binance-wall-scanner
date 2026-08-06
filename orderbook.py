@@ -84,7 +84,14 @@ class OrderBook:
                 return True
             if event["u"] <= self.last_update_id:
                 return True  # устаревшее событие, игнор
-            if event.get("pu") is not None and event["pu"] != self.last_update_id:
+            prev_u = event.get("pu")
+            first_u = event.get("U")
+            if prev_u is not None:
+                if prev_u != self.last_update_id:
+                    self.synced = False
+                    self._buffer = [event]
+                    return False
+            elif first_u is not None and first_u > self.last_update_id + 1:
                 self.synced = False
                 self._buffer = [event]
                 return False

@@ -9,26 +9,32 @@
 REST-эндпоинт, отдающий тикеры сразу по всему рынку одним запросом:
 
   BINANCE/ASTERDEX: GET /fapi/v1/ticker/24hr            (без параметра symbol)
+  SPOT-клоны:       GET /api/v3|v1/ticker/24hr
   GATE:             GET /api/v4/futures/usdt/tickers
+  GATE SPOT:        GET /api/v4/spot/tickers
   OKX:              GET /api/v5/market/tickers?instType=SWAP
+  OKX SPOT:         GET /api/v5/market/tickers?instType=SPOT
+  MEXC:             GET /api/v1/contract/ticker
+  MEXC SPOT:        GET /api/v3/ticker/24hr
   BYBIT:            GET /v5/market/tickers?category=linear
 
 Поэтому rate-лимиты тут не проблема (по одному запросу на биржу раз в
 POLL_INTERVAL_SEC), в отличие от сканера плотностей, где именно REST-снапшоты
 по каждому символу были источником шторма/429 (см. ws_manager.py, gui.py).
 
-"Ёрш"/"лесенка" (см. HEDGEHOG_*) считается из той же самой скользящей истории
-цены, что и импульс — просто окно длиннее (HEDGEHOG_WINDOW_SEC). Отдельных
-REST-запросов под это не заводим: диапазон/объём/касания границ — производные
-величины от уже опрашиваемых раз в POLL_INTERVAL_SEC тикеров. За счёт этого
-частота выборки (раз в 15 сек) грубее, чем у специализированных ботов на
-1-минутных свечах — метрики приблизительные, но кандидатов на неликвиде
-находят без единого лишнего запроса к биржам.
+"Ёрш"/"лесенка" (см. HEDGEHOG_*) считается из скользящей истории цены, что и
+импульс — просто окно длиннее (HEDGEHOG_WINDOW_SEC). Живой поток обновляется
+по тикерам раз в POLL_INTERVAL_SEC, а для вкладки "События ершей" при старте
+дополнительно подгружается история Binance futures/Bybit минутными свечами:
+так не надо ждать первые часы после запуска. Стаканную историю биржи задним
+числом не отдают, поэтому подтверждение стаканом всегда проверяется по
+текущему стакану.
 """
 
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -37,22 +43,101 @@ IMPULSE_WINDOW_SEC = 180.0   # 3 минуты — окно для расчёта
 IMPULSE_HIGHLIGHT_PCT = 2.0  # |impulse_pct| от этого значения — подсвечиваем в UI как "⚡"
 TOP_N = 20
 
-HEDGEHOG_WINDOW_SEC = 60 * 90       # 90 минут — окно для диапазона/касаний "ерша"
+HEDGEHOG_WINDOW_SEC = 60 * 120      # 2 часа — окно для диапазона/касаний "ерша"
 HEDGEHOG_MIN_SAMPLES = 30           # минимум точек в окне, чтобы вообще считать метрику (прогрев)
 HEDGEHOG_TOUCH_TOLERANCE_PCT = 15.0 # "касанием" границы диапазона считаем попадание в ближайшие N% от его ширины
 HEDGEHOG_VOL_60M_SEC = 60 * 60
 HEDGEHOG_VOL_10M_SEC = 10 * 60
+HEDGEHOG_EVENT_EXCHANGES = ("BINANCE", "BYBIT")
+HEDGEHOG_EVENT_MAX_RANGE_PCT = 3.0
+HEDGEHOG_EVENT_MIN_NEEDLES = 3
+HEDGEHOG_BOOTSTRAP_HOURS = 2.0
+HEDGEHOG_BOOTSTRAP_WORKERS = 4
+HEDGEHOG_BOOTSTRAP_PROGRESS_EVERY = 25
+
+SPIKE_REVERSAL_EXCHANGES = ("BINANCE", "BYBIT")
+SPIKE_REVERSAL_HISTORY_SEC = 60 * 120
+SPIKE_REVERSAL_MIN_SAMPLES = 8
+SPIKE_REVERSAL_MIN_COUNT = 3
+SPIKE_REVERSAL_DEFAULT_RETURN_PCT = 70.0
+SPIKE_REVERSAL_DEFAULT_MIN_MOVE_PCT = 1.5
+SPIKE_REVERSAL_MAX_DURATION_SEC = 120.0
+SPIKE_REVERSAL_MIN_GAP_SEC = 30.0
+BINANCE_FUTURES_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+BYBIT_KLINES_URL = "https://api.bybit.com/v5/market/kline"
 
 # самая долгая история, которую вообще нужно хранить — под неё считается retention в _update_history
-HISTORY_RETENTION_SEC = max(IMPULSE_WINDOW_SEC, HEDGEHOG_WINDOW_SEC, HEDGEHOG_VOL_60M_SEC) + POLL_INTERVAL_SEC
+HISTORY_RETENTION_SEC = max(IMPULSE_WINDOW_SEC, HEDGEHOG_WINDOW_SEC, HEDGEHOG_VOL_60M_SEC,
+                            SPIKE_REVERSAL_HISTORY_SEC) + POLL_INTERVAL_SEC
 
 REST_URLS = {
     "BINANCE": "https://fapi.binance.com/fapi/v1/ticker/24hr",
+    "BINANCE SPOT": "https://api.binance.com/api/v3/ticker/24hr",
     "ASTERDEX": "https://fapi.asterdex.com/fapi/v1/ticker/24hr",
+    "ASTERDEX SPOT": "https://sapi.asterdex.com/api/v1/ticker/24hr",
     "GATE": "https://fx-api.gateio.ws/api/v4/futures/usdt/tickers",
+    "GATE SPOT": "https://api.gateio.ws/api/v4/spot/tickers",
     "OKX": "https://www.okx.com/api/v5/market/tickers",
+    "MEXC": "https://contract.mexc.com/api/v1/contract/ticker",
+    "MEXC SPOT": "https://api.mexc.com/api/v3/ticker/24hr",
     "BYBIT": "https://api.bybit.com/v5/market/tickers",
 }
+
+# --- "живая тишина": профиль монеты ЗА ЧАС ДО памп-выноса ---------------
+# Пороги не выдуманы: посчитаны по 15 размеченным сигналам из телеграм-канала
+# "splash 50% MEXC" (см. PROJECT_NOTES). У 7 из 9 пампов за час до старта цена
+# ходила в узком, но ЖИВОМ диапазоне при низком объёме, который НЕ разгонялся.
+# Дампы (-33%) выглядели ровно наоборот — диапазон 55-135%, разгон объёма
+# 2-10x, — поэтому верхние границы тут не формальность, а именно то, что
+# отсекает "похмелье" после уже случившегося выноса.
+EARLY_WINDOW_SEC = 3600.0     # окно, на котором считаем профиль (1 час)
+# Минимум точек в окне. Порог низкий сознательно: история может прийти как с
+# живых опросов (раз в 15 сек -> 240 точек в час), так и из бутстрапа минутными
+# свечами (60 точек в час). Настоящую защиту от вырожденных случаев даёт не это
+# число, а проверка РЕАЛЬНОГО охвата окна по времени в _early_metrics.
+EARLY_MIN_SAMPLES = 40
+EARLY_RANGE_MIN_PCT = 3.0     # НИЖНЯЯ граница — важнее верхней: отсекает мёртвые
+                              # монеты с плоской ценой (их 35% рынка, и они никогда
+                              # не стреляют). Без этого порога кандидатов 453, с ним — 68.
+EARLY_RANGE_MAX_PCT = 15.0    # выше — монету уже колбасит, мы опоздали
+EARLY_VOL_MIN_USD = 2_500     # ниже — неликвид, из которого не выйти
+EARLY_VOL_MAX_USD = 12_000    # выше — движение уже началось без нас
+EARLY_ACCEL_MAX = 2.0         # объём НЕ должен разгоняться: у пампов было 0.4-1.7x
+
+# "Эксклюзивность" листинга. Монета, которая уже торгуется на биржах первого
+# эшелона, интересна нам гораздо меньше: её стакан толстый, и вынос на +50% с
+# тонкой книги там не делается. Оставляем только те, что живут на MEXC и/или
+# площадках второго эшелона (AsterDEX, Gate, Bitget и т.п.).
+MAJOR_EXCHANGES = ("BINANCE", "OKX", "BYBIT")
+# Binance в скринере подключён ФЬЮЧЕРСНЫМ эндпоинтом, поэтому монета, у которой
+# есть спот, но нет фьючерса, из тикеров не видна и ошибочно сошла бы за
+# эксклюзив MEXC. Список спота тянем отдельно — он меняется редко, поэтому
+# запрашивается один раз при старте, а не каждый цикл.
+BINANCE_SPOT_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
+
+# --- Открытый интерес (OI) фьючерсов MEXC ---------------------------------
+# OI существует ТОЛЬКО для фьючерсов, а вотч-лист "Ранних" — спот. По факту
+# фьючерс есть лишь у ~22% кандидатов, остальные чисто спотовые. Поэтому OI —
+# НЕ фильтр-отсекатель (иначе выбросили бы 78% списка, включая спотовые пампы),
+# а бонусный сигнал: спотовые монеты остаются в списке с прочерком.
+#
+# Величина OI сама по себе слабый сигнал (у реально выстреливших монет из
+# канала OI был мизерный). Ценен именно РОСТ OI: если на затихшей монете растёт
+# открытый интерес — трейдеры открывают позиции, готовятся к движению. Рост
+# считаем по ЧИСЛУ КОНТРАКТОВ (holdVol), а не по OI в долларах: иначе скачок
+# цены раздул бы "рост" даже при неизменных позициях.
+MEXC_FUTURES_TICKER_URL = "https://contract.mexc.com/api/v1/contract/ticker"
+MEXC_FUTURES_DETAIL_URL = "https://contract.mexc.com/api/v1/contract/detail"
+OI_CHANGE_WINDOW_SEC = 3600.0     # окно для ΔOI (1 час, как у профиля "живой тишины")
+OI_CHANGE_MIN_SPAN_SEC = 600.0    # без 10+ мин истории ΔOI шумный — показываем прочерк
+OI_RISE_HIGHLIGHT_PCT = 20.0      # рост OI от этого — подсветка и подъём выше в списке
+OI_RETENTION_SEC = OI_CHANGE_WINDOW_SEC + POLL_INTERVAL_SEC
+
+# Бутстрап истории свечами при старте (см. bootstrap_mexc_history).
+MEXC_KLINES_URL = "https://api.mexc.com/api/v3/klines"
+BOOTSTRAP_WORKERS = 10        # /api/v3/klines имеет вес 1 при лимите 500/10с — 10 потоков это ~5% бюджета
+BOOTSTRAP_V24_MIN = 20_000    # монеты вне этого коридора по 24ч-объёму физически не могут
+BOOTSTRAP_V24_MAX = 3_000_000 # пройти фильтр EARLY_VOL_*, поэтому свечи по ним не тянем
 
 
 def _fetch_binance_style(exchange: str) -> list:
@@ -98,26 +183,103 @@ def _fetch_gate() -> list:
     return out
 
 
-def _fetch_okx() -> list:
-    resp = requests.get(REST_URLS["OKX"], params={"instType": "SWAP"}, timeout=10)
+def _fetch_gate_spot() -> list:
+    resp = requests.get(REST_URLS["GATE SPOT"], timeout=10)
+    resp.raise_for_status()
+    out = []
+    for item in resp.json():
+        pair = item.get("currency_pair", "")
+        if not pair.endswith("_USDT"):
+            continue
+        try:
+            symbol = pair.replace("_", "").upper()
+            out.append({
+                "exchange": "GATE SPOT",
+                "symbol": symbol,
+                "last": float(item["last"]),
+                "change_pct_24h": float(item.get("change_percentage", 0.0)),
+                "quote_volume": float(item.get("quote_volume", item.get("base_volume", 0.0))),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out
+
+
+def _okx_quote_volume(item, last, inst_type):
+    vol_ccy = float(item.get("volCcy24h", 0.0) or 0.0)
+    return vol_ccy * last if inst_type == "SWAP" else vol_ccy
+
+
+def _fetch_okx(inst_type="SWAP", exchange="OKX") -> list:
+    resp = requests.get(REST_URLS["OKX"], params={"instType": inst_type}, timeout=10)
     resp.raise_for_status()
     data = resp.json()
     out = []
+    suffix = "-USDT-SWAP" if inst_type == "SWAP" else "-USDT"
     for item in data.get("data", []):
         inst_id = item.get("instId", "")
-        if not inst_id.endswith("-USDT-SWAP"):
+        if not inst_id.endswith(suffix):
             continue
         try:
             last = float(item["last"])
             open24h = float(item["open24h"])
             change_pct = ((last - open24h) / open24h * 100) if open24h else 0.0
             symbol = inst_id.replace("-SWAP", "").replace("-", "").upper()
+            # OKX SPOT returns volCcy24h in quote currency for USDT pairs, while
+            # OKX SWAP returns it in the base coin. Convert swaps to USDT.
+            quote_volume = _okx_quote_volume(item, last, inst_type)
             out.append({
-                "exchange": "OKX",
+                "exchange": exchange,
                 "symbol": symbol,
                 "last": last,
                 "change_pct_24h": change_pct,
-                "quote_volume": float(item.get("volCcy24h", 0.0)),
+                "quote_volume": quote_volume,
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out
+
+
+def _fetch_mexc() -> list:
+    resp = requests.get(REST_URLS["MEXC"], timeout=10)
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    if isinstance(data, dict):
+        data = [data]
+    out = []
+    for item in data:
+        symbol = str(item.get("symbol", "")).replace("_", "").upper()
+        if not symbol.endswith("USDT"):
+            continue
+        try:
+            last = float(item["lastPrice"])
+            out.append({
+                "exchange": "MEXC",
+                "symbol": symbol,
+                "last": last,
+                "change_pct_24h": float(item.get("riseFallRate", 0.0)) * 100,
+                "quote_volume": float(item.get("amount24", 0.0)),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out
+
+
+def _fetch_mexc_spot() -> list:
+    resp = requests.get(REST_URLS["MEXC SPOT"], timeout=10)
+    resp.raise_for_status()
+    out = []
+    for item in resp.json():
+        symbol = str(item.get("symbol", "")).upper()
+        if not symbol.endswith("USDT"):
+            continue
+        try:
+            out.append({
+                "exchange": "MEXC SPOT",
+                "symbol": symbol,
+                "last": float(item["lastPrice"]),
+                "change_pct_24h": float(item.get("priceChangePercent", 0.0)) * 100,
+                "quote_volume": float(item.get("quoteVolume", 0.0)),
             })
         except (KeyError, ValueError, TypeError):
             continue
@@ -148,11 +310,151 @@ def _fetch_bybit() -> list:
     return out
 
 
+def fetch_hedgehog_klines(exchange, symbol, limit):
+    """Минутные свечи для быстрой подгрузки истории ершей.
+
+    Возвращает список:
+    (open_ts_sec, open, high, low, close, quote_volume_for_minute)
+    """
+    limit = max(1, min(1500, int(limit)))
+    if exchange == "BINANCE":
+        resp = requests.get(
+            BINANCE_FUTURES_KLINES_URL,
+            params={"symbol": symbol, "interval": "1m", "limit": limit},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        out = []
+        for c in resp.json():
+            try:
+                out.append((
+                    int(c[0]) / 1000.0,
+                    float(c[1]),
+                    float(c[2]),
+                    float(c[3]),
+                    float(c[4]),
+                    float(c[7]),
+                ))
+            except (IndexError, TypeError, ValueError):
+                continue
+        return out
+
+    if exchange == "BYBIT":
+        resp = requests.get(
+            BYBIT_KLINES_URL,
+            params={"category": "linear", "symbol": symbol, "interval": "1", "limit": limit},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("retCode") != 0:
+            raise RuntimeError(f"Bybit retCode={data.get('retCode')} {data.get('retMsg')}")
+        out = []
+        for c in data.get("result", {}).get("list", []):
+            try:
+                out.append((
+                    int(c[0]) / 1000.0,
+                    float(c[1]),
+                    float(c[2]),
+                    float(c[3]),
+                    float(c[4]),
+                    float(c[6]),
+                ))
+            except (IndexError, TypeError, ValueError):
+                continue
+        return sorted(out, key=lambda x: x[0])
+
+    raise ValueError(f"hedgehog kline bootstrap is not supported for {exchange}")
+
+
+def _history_entries_from_klines(candles, cumulative_quote_volume_end):
+    """Превращает 1m OHLCV в точки истории цены.
+
+    Биржа не говорит, что внутри минуты было раньше — high или low. Поэтому
+    используем простую эвристику: в зелёной свече low -> high, в красной
+    high -> low. Это приближение, но оно позволяет не потерять фитили, которые
+    важны для вкладки "События ершей".
+    """
+    total_volume = sum(max(0.0, float(c[5] or 0.0)) for c in candles)
+    base_volume = max(0.0, float(cumulative_quote_volume_end or 0.0) - total_volume)
+    running_volume = 0.0
+    entries = []
+    for ts, open_p, high_p, low_p, close_p, quote_volume in candles:
+        quote_volume = max(0.0, float(quote_volume or 0.0))
+        before_volume = base_volume + running_volume
+        running_volume += quote_volume
+        after_volume = base_volume + running_volume
+        if close_p >= open_p:
+            middle = ((ts + 20, low_p), (ts + 40, high_p))
+        else:
+            middle = ((ts + 20, high_p), (ts + 40, low_p))
+        points = [(ts + 5, open_p), *middle, (ts + 59, close_p)]
+        for point_ts, price in points:
+            if price > 0:
+                volume = after_volume if point_ts >= ts + 59 else before_volume
+                entries.append((point_ts, price, volume))
+    return entries
+
+
+def fetch_binance_spot_symbols() -> set:
+    """Все USDT-пары со СПОТА Binance (нормализованные, вида "BTCUSDT").
+    Используется только для проверки "эксклюзивности" листинга, не для цен."""
+    resp = requests.get(BINANCE_SPOT_INFO_URL, timeout=25)
+    resp.raise_for_status()
+    return {s.get("symbol", "") for s in resp.json().get("symbols", [])
+            if s.get("symbol", "").endswith("USDT")}
+
+
+def fetch_mexc_contract_sizes() -> dict:
+    """Размер контракта на символ (contractSize) для перевода OI в USD.
+    Ключ нормализуем в спот-форму ("HOODRAT_USDT" -> "HOODRATUSDT")."""
+    resp = requests.get(MEXC_FUTURES_DETAIL_URL, timeout=20)
+    resp.raise_for_status()
+    out = {}
+    for item in resp.json().get("data", []):
+        sym = item.get("symbol", "")
+        if not sym.endswith("_USDT"):
+            continue
+        try:
+            out[sym.replace("_USDT", "") + "USDT"] = float(item["contractSize"])
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out
+
+
+def fetch_mexc_oi() -> dict:
+    """Открытый интерес фьючерсов MEXC одним запросом по всему рынку.
+    Возвращает {"BASEUSDT": (holdVol_контрактов, last_price)}. holdVol — это
+    число открытых контрактов; в USD переводится через contractSize отдельно."""
+    resp = requests.get(MEXC_FUTURES_TICKER_URL, timeout=15)
+    resp.raise_for_status()
+    out = {}
+    for item in resp.json().get("data", []):
+        sym = item.get("symbol", "")
+        if not sym.endswith("_USDT"):
+            continue
+        hold = item.get("holdVol")
+        if hold is None:
+            continue
+        try:
+            price = float(item.get("lastPrice") or item.get("fairPrice") or 0)
+            out[sym.replace("_USDT", "") + "USDT"] = (float(hold), price)
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
 FETCHERS = {
     "BINANCE": lambda: _fetch_binance_style("BINANCE"),
+    "BINANCE SPOT": lambda: _fetch_binance_style("BINANCE SPOT"),
     "ASTERDEX": lambda: _fetch_binance_style("ASTERDEX"),
+    "ASTERDEX SPOT": lambda: _fetch_binance_style("ASTERDEX SPOT"),
     "GATE": _fetch_gate,
-    "OKX": _fetch_okx,
+    "GATE SPOT": _fetch_gate_spot,
+    "OKX": lambda: _fetch_okx("SWAP", "OKX"),
+    "OKX SPOT": lambda: _fetch_okx("SPOT", "OKX SPOT"),
+    "MEXC": _fetch_mexc,
+    "MEXC SPOT": _fetch_mexc_spot,
     "BYBIT": _fetch_bybit,
 }
 
@@ -165,10 +467,9 @@ class MarketScanner:
     остальные колбэки в этом проекте, GUI должен сам передать результат в
     свою очередь, а не трогать Tk-виджеты напрямую отсюда.
 
-    exchanges=None — опрашивать все зарегистрированные в FETCHERS биржи
-    (используется вкладкой "Топ движений"). exchanges=["BINANCE","BYBIT"] —
-    только перечисленные (используется вкладкой "Ерши" — по просьбе
-    ограничиться этими двумя, без Mexc и без ASTERDEX/GATE/OKX)."""
+    exchanges=None — опрашивать все зарегистрированные в FETCHERS биржи.
+    В GUI список источников задаётся явно: "Топ движений" остаётся без spot,
+    а "Ерши" получают spot-рынки дополнительно."""
 
     def __init__(self, on_update, on_status=None, exchanges=None):
         self.on_update = on_update
@@ -181,9 +482,21 @@ class MarketScanner:
         self._lock = threading.Lock()
         # изменяемое поле (не модульная константа) — GUI может перенастроить
         # окно импульса в рантайме без пересоздания сканера. HISTORY_RETENTION_SEC
-        # уже с большим запасом (задаётся окном "ершей", 90 мин) — под любое
+        # уже с большим запасом (задаётся окном "ершей", 2 часа) — под любое
         # разумное окно импульса истории хватит без досчёта retention.
         self.impulse_window_sec = IMPULSE_WINDOW_SEC
+        self.spike_reversal_history_sec = SPIKE_REVERSAL_HISTORY_SEC
+        self.spike_reversal_return_pct = SPIKE_REVERSAL_DEFAULT_RETURN_PCT
+        self.spike_reversal_min_move_pct = SPIKE_REVERSAL_DEFAULT_MIN_MOVE_PCT
+        self.spike_reversal_max_duration_sec = SPIKE_REVERSAL_MAX_DURATION_SEC
+        # заполняется в bootstrap_mexc_history; пустое множество безопасно —
+        # фильтр эксклюзивности просто не увидит спот-листинги Binance
+        self.binance_spot_symbols = set()
+        # OI фьючерсов MEXC: размер контракта на символ (для OI в USD) и
+        # скользящая история числа контрактов (для ΔOI). Заполняются на лету,
+        # пустые значения безопасны — метрики просто будут "нет данных".
+        self.mexc_contract_size = {}   # "BASEUSDT" -> contractSize
+        self._oi_history = {}          # "BASEUSDT" -> deque[(ts, holdVol_контрактов, price)]
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -201,6 +514,10 @@ class MarketScanner:
                     all_tickers.extend(fetch())
                 except Exception as e:
                     self.on_status(f"[Топ рынка] ошибка {exchange}: {e}")
+            # OI тянем только если MEXC SPOT вообще опрашивается (вкладка "Ерши" его
+            # не опрашивает, ей OI не нужен). Отдельный эндпоинт, один запрос.
+            if "MEXC SPOT" in self._fetchers:
+                self._update_oi_history()
             if all_tickers:
                 self._update_history(all_tickers)
                 self.on_update(all_tickers)
@@ -222,6 +539,52 @@ class MarketScanner:
                     dq.popleft()
                 t["impulse_pct"] = self._impulse_pct(dq, now)
                 t.update(self._hedgehog_metrics(dq, now))
+                t.update(self._spike_reversal_metrics(dq, now))
+                t.update(self._early_metrics(dq, now, t))
+                if t["exchange"] == "MEXC SPOT":
+                    t.update(self._oi_metrics(t["symbol"], now))
+
+    def _update_oi_history(self):
+        """Опрос OI фьючерсов MEXC (один запрос) и обновление скользящей
+        истории числа контрактов на символ. Сетевая ошибка не роняет цикл —
+        просто в этот тик OI не обновится."""
+        try:
+            oi = fetch_mexc_oi()
+        except Exception as e:
+            self.on_status(f"[OI] ошибка опроса: {e}")
+            return
+        now = time.time()
+        with self._lock:
+            for base, (hold, price) in oi.items():
+                dq = self._oi_history.setdefault(base, deque())
+                dq.append((now, hold, price))
+                while dq and now - dq[0][0] > OI_RETENTION_SEC:
+                    dq.popleft()
+
+    def _oi_metrics(self, symbol, now):
+        """OI в USD (последний снимок) и рост ΔOI% по числу контрактов за окно.
+        has_oi=False для чисто спотовых монет без фьючерса — GUI покажет им
+        прочерк, из списка их это не выбрасывает."""
+        result = {"has_oi": False, "oi_usd": 0.0, "oi_change_pct": 0.0}
+        dq = self._oi_history.get(symbol)
+        if not dq:
+            return result
+        _ts_now, hold_now, price_now = dq[-1]
+        csize = self.mexc_contract_size.get(symbol, 0.0)
+        result["has_oi"] = True
+        result["oi_usd"] = hold_now * csize * price_now
+
+        # ΔOI считаем от самого раннего замера В ОКНЕ, но только если история
+        # покрывает хотя бы OI_CHANGE_MIN_SPAN_SEC — иначе процент шумный
+        cutoff = now - OI_CHANGE_WINDOW_SEC
+        base_ts, base_hold = None, None
+        for ts, hold, _p in dq:
+            if ts >= cutoff:
+                base_ts, base_hold = ts, hold
+                break
+        if base_hold and now - base_ts >= OI_CHANGE_MIN_SPAN_SEC:
+            result["oi_change_pct"] = (hold_now - base_hold) / base_hold * 100
+        return result
 
     def _impulse_pct(self, dq, now):
         if len(dq) < 2:
@@ -246,15 +609,21 @@ class MarketScanner:
         window_cutoff = now - HEDGEHOG_WINDOW_SEC
         window_prices = [price for ts, price, _vol in dq if ts >= window_cutoff]
         result = {
+            "hh_samples": len(window_prices),
             "hh_ready": len(window_prices) >= HEDGEHOG_MIN_SAMPLES,
+            "hh_low": 0.0,
+            "hh_high": 0.0,
             "hh_range_pct": 0.0,
             "hh_touch_top": 0.0,
             "hh_touch_bot": 0.0,
+            "hh_needle_count": 0,
             "vol_60m": 0.0,
             "vol_10m": 0.0,
         }
         if window_prices:
             hi, lo = max(window_prices), min(window_prices)
+            result["hh_low"] = lo
+            result["hh_high"] = hi
             if lo:
                 result["hh_range_pct"] = (hi - lo) / lo * 100
             span = hi - lo
@@ -262,6 +631,21 @@ class MarketScanner:
                 tol = span * HEDGEHOG_TOUCH_TOLERANCE_PCT / 100
                 result["hh_touch_top"] = sum(1 for p in window_prices if p >= hi - tol) / len(window_prices)
                 result["hh_touch_bot"] = sum(1 for p in window_prices if p <= lo + tol) / len(window_prices)
+                last_zone = None
+                needle_count = 0
+                for price in window_prices:
+                    if price >= hi - tol:
+                        zone = "top"
+                    elif price <= lo + tol:
+                        zone = "bottom"
+                    else:
+                        zone = None
+                    if zone is None or zone == last_zone:
+                        continue
+                    if last_zone is not None:
+                        needle_count += 1
+                    last_zone = zone
+                result["hh_needle_count"] = needle_count
 
         # объём за 60м/10м — сумма положительных дельт кумулятивного 24ч
         # объёма между соседними замерами внутри окна. Приближение: 24ч-объём
@@ -283,6 +667,408 @@ class MarketScanner:
             result[out_key] = vol_sum
         return result
 
+    def _spike_reversal_metrics(self, dq, now):
+        """Find short spikes that return back into the prior area.
+
+        A "down" event is a quick drop followed by a buyback. An "up" event is a
+        quick pop followed by a sell-back. The GUI then requires at least three
+        such events on the same symbol before showing a candidate.
+        """
+        history_sec = max(60.0, min(SPIKE_REVERSAL_HISTORY_SEC,
+                                    float(getattr(self, "spike_reversal_history_sec",
+                                                  SPIKE_REVERSAL_HISTORY_SEC) or 0.0)))
+        min_return_pct = max(0.0, min(100.0, float(getattr(self, "spike_reversal_return_pct",
+                                                          SPIKE_REVERSAL_DEFAULT_RETURN_PCT) or 0.0)))
+        min_move_pct = max(0.0, float(getattr(self, "spike_reversal_min_move_pct",
+                                             SPIKE_REVERSAL_DEFAULT_MIN_MOVE_PCT) or 0.0))
+        max_duration_sec = max(15.0, min(300.0, float(getattr(self, "spike_reversal_max_duration_sec",
+                                                             SPIKE_REVERSAL_MAX_DURATION_SEC) or 0.0)))
+        cutoff = now - history_sec
+        window = [(ts, price) for ts, price, _vol in dq if ts >= cutoff and price > 0]
+        result = {
+            "rev_ready": len(window) >= SPIKE_REVERSAL_MIN_SAMPLES,
+            "rev_samples": len(window),
+            "rev_count": 0,
+            "rev_down_count": 0,
+            "rev_up_count": 0,
+            "rev_last_side": "",
+            "rev_last_ts": 0.0,
+            "rev_last_price": 0.0,
+            "rev_last_extreme": 0.0,
+            "rev_last_move_pct": 0.0,
+            "rev_last_return_pct": 0.0,
+            "rev_last_duration_sec": 0.0,
+            "rev_avg_move_pct": 0.0,
+            "rev_best_move_pct": 0.0,
+            "rev_avg_return_pct": 0.0,
+            "rev_events": [],
+        }
+        if not result["rev_ready"]:
+            return result
+
+        events = self._detect_spike_reversals(
+            window,
+            min_move_pct=min_move_pct,
+            min_return_pct=min_return_pct,
+            max_duration_sec=max_duration_sec,
+        )
+        if not events:
+            return result
+
+        down_count = sum(1 for ev in events if ev["side"] == "down")
+        up_count = sum(1 for ev in events if ev["side"] == "up")
+        last = max(events, key=lambda ev: ev["return_ts"])
+        result.update({
+            "rev_count": len(events),
+            "rev_down_count": down_count,
+            "rev_up_count": up_count,
+            "rev_last_side": last["side"],
+            "rev_last_ts": last["return_ts"],
+            "rev_last_price": last["return_price"],
+            "rev_last_extreme": last["extreme_price"],
+            "rev_last_move_pct": last["move_pct"],
+            "rev_last_return_pct": last["return_pct"],
+            "rev_last_duration_sec": last["duration_sec"],
+            "rev_avg_move_pct": sum(ev["move_pct"] for ev in events) / len(events),
+            "rev_best_move_pct": max(ev["move_pct"] for ev in events),
+            "rev_avg_return_pct": sum(ev["return_pct"] for ev in events) / len(events),
+            "rev_events": events[-20:],
+        })
+        return result
+
+    @staticmethod
+    def _detect_spike_reversals(points, min_move_pct=SPIKE_REVERSAL_DEFAULT_MIN_MOVE_PCT,
+                                min_return_pct=SPIKE_REVERSAL_DEFAULT_RETURN_PCT,
+                                max_duration_sec=SPIKE_REVERSAL_MAX_DURATION_SEC):
+        points = sorted((float(ts), float(price)) for ts, price in points if price > 0)
+        if len(points) < 3:
+            return []
+        min_move_pct = max(0.0, float(min_move_pct or 0.0))
+        return_ratio = max(0.0, min(1.0, float(min_return_pct or 0.0) / 100.0))
+        max_duration_sec = max(1.0, float(max_duration_sec or SPIKE_REVERSAL_MAX_DURATION_SEC))
+
+        raw = []
+        n = len(points)
+        for start_idx in range(n - 2):
+            start_ts, start_price = points[start_idx]
+            limit_ts = start_ts + max_duration_sec
+            end_idx = start_idx + 1
+            while end_idx < n and points[end_idx][0] <= limit_ts:
+                end_idx += 1
+            segment = points[start_idx + 1:end_idx]
+            if len(segment) < 2:
+                continue
+
+            low_rel, (low_ts, low_price) = min(enumerate(segment), key=lambda item: item[1][1])
+            if low_price < start_price:
+                move_pct = (start_price - low_price) / start_price * 100
+                if move_pct >= min_move_pct:
+                    target = low_price + (start_price - low_price) * return_ratio
+                    for return_ts, return_price in segment[low_rel + 1:]:
+                        if return_price >= target:
+                            returned = (return_price - low_price) / (start_price - low_price) * 100
+                            raw.append({
+                                "side": "down",
+                                "base_ts": start_ts,
+                                "base_price": start_price,
+                                "extreme_ts": low_ts,
+                                "extreme_price": low_price,
+                                "return_ts": return_ts,
+                                "return_price": return_price,
+                                "duration_sec": return_ts - start_ts,
+                                "move_pct": move_pct,
+                                "return_pct": min(999.0, returned),
+                            })
+                            break
+
+            high_rel, (high_ts, high_price) = max(enumerate(segment), key=lambda item: item[1][1])
+            if high_price > start_price:
+                move_pct = (high_price - start_price) / start_price * 100
+                if move_pct >= min_move_pct:
+                    target = high_price - (high_price - start_price) * return_ratio
+                    for return_ts, return_price in segment[high_rel + 1:]:
+                        if return_price <= target:
+                            returned = (high_price - return_price) / (high_price - start_price) * 100
+                            raw.append({
+                                "side": "up",
+                                "base_ts": start_ts,
+                                "base_price": start_price,
+                                "extreme_ts": high_ts,
+                                "extreme_price": high_price,
+                                "return_ts": return_ts,
+                                "return_price": return_price,
+                                "duration_sec": return_ts - start_ts,
+                                "move_pct": move_pct,
+                                "return_pct": min(999.0, returned),
+                            })
+                            break
+
+        raw.sort(key=lambda ev: ev["move_pct"], reverse=True)
+        chosen = []
+        min_gap = min(SPIKE_REVERSAL_MIN_GAP_SEC, max_duration_sec / 2.0)
+        for ev in raw:
+            if any(ev["side"] == prev["side"] and abs(ev["extreme_ts"] - prev["extreme_ts"]) <= min_gap
+                   for prev in chosen):
+                continue
+            chosen.append(ev)
+        return sorted(chosen, key=lambda ev: ev["return_ts"])
+
+    def _early_metrics(self, dq, now, ticker):
+        """Профиль "живой тишины" за EARLY_WINDOW_SEC. Считается из той же
+        скользящей истории, что импульс и "ерши" — дополнительных запросов к
+        бирже не делает.
+
+        vol_accel — во сколько раз средний объём последних 10 минут отличается
+        от средних 50 минут до них. Именно ЭТО отличало памп от дампа: перед
+        пампом объём затихал (0.4-1.7x), перед дампом взрывался (1.8-10x)."""
+        result = {"early_ready": False, "range_60m": 0.0, "vol_accel": 0.0}
+        cutoff = now - EARLY_WINDOW_SEC
+        window = [(ts, price) for ts, price, _vol in dq if ts >= cutoff]
+        if len(window) < EARLY_MIN_SAMPLES:
+            return result
+        # история должна РЕАЛЬНО покрывать окно, а не быть плотной пачкой
+        # замеров за последние пару минут (иначе диапазон занижен и монета
+        # ложно выглядит "затихшей")
+        if now - window[0][0] < EARLY_WINDOW_SEC * 0.9:
+            return result
+
+        prices = [p for _ts, p in window]
+        lo, hi = min(prices), max(prices)
+        if not lo:
+            return result
+        result["range_60m"] = (hi - lo) / lo * 100
+
+        vol_60m = ticker.get("vol_60m", 0.0)
+        vol_10m = ticker.get("vol_10m", 0.0)
+        prior_50m = vol_60m - vol_10m
+        if prior_50m > 0:
+            result["vol_accel"] = (vol_10m / 10.0) / (prior_50m / 50.0)
+        result["early_ready"] = True
+        return result
+
+    def bootstrap_hedgehog_history(self, exchanges=HEDGEHOG_EVENT_EXCHANGES,
+                                   hours=HEDGEHOG_BOOTSTRAP_HOURS,
+                                   on_progress=None, on_done=None):
+        """Подгрузить минутные свечи для вкладки "События ершей".
+
+        Это ускоряет старт: вместо ожидания 30 живых 15-секундных опросов
+        программа почти сразу получает ценовую историю за последние часы.
+        Историю стакана биржи задним числом не отдают, поэтому стаканное
+        подтверждение всё равно проверяется текущим REST-стаканом при событии.
+        """
+        limit = max(1, int(hours * 60))
+
+        def progress(**kwargs):
+            if on_progress:
+                on_progress(kwargs)
+
+        targets = []
+        progress(state="loading_tickers", done=0, total=0, seeded=0, errors=0, hours=hours)
+        for exchange in exchanges:
+            fetch = FETCHERS.get(exchange)
+            if not fetch:
+                continue
+            try:
+                tickers = fetch()
+            except Exception as e:
+                progress(state="ticker_error", exchange=exchange, done=0, total=0,
+                         seeded=0, errors=1, hours=hours, error=str(e))
+                continue
+            for ticker in tickers:
+                symbol = ticker.get("symbol")
+                if symbol:
+                    targets.append((exchange, symbol, float(ticker.get("quote_volume", 0.0) or 0.0)))
+
+        total = len(targets)
+        if not total:
+            progress(state="done", done=0, total=0, seeded=0, errors=0, hours=hours)
+            if on_done:
+                on_done(0)
+            return
+
+        progress(state="loading_history", done=0, total=total, seeded=0, errors=0, hours=hours)
+
+        def seed(target):
+            exchange, symbol, quote_volume = target
+            candles = fetch_hedgehog_klines(exchange, symbol, limit)
+            entries = _history_entries_from_klines(candles, quote_volume)
+            return exchange, symbol, entries
+
+        done = seeded = errors = 0
+        with ThreadPoolExecutor(max_workers=HEDGEHOG_BOOTSTRAP_WORKERS) as pool:
+            futures = [pool.submit(seed, target) for target in targets]
+            for future in as_completed(futures):
+                if self._stop:
+                    break
+                done += 1
+                try:
+                    result = future.result()
+                except Exception:
+                    errors += 1
+                    result = None
+                if result:
+                    exchange, symbol, entries = result
+                    if entries:
+                        key = f"{exchange}:{symbol}"
+                        with self._lock:
+                            existing = self._history.get(key, deque())
+                            oldest_live = existing[0][0] if existing else float("inf")
+                            merged = deque(e for e in entries if e[0] < oldest_live)
+                            merged.extend(existing)
+                            now = time.time()
+                            while merged and now - merged[0][0] > HISTORY_RETENTION_SEC:
+                                merged.popleft()
+                            self._history[key] = merged
+                        seeded += 1
+                if done == 1 or done == total or done % HEDGEHOG_BOOTSTRAP_PROGRESS_EVERY == 0:
+                    progress(state="loading_history", done=done, total=total,
+                             seeded=seeded, errors=errors, hours=hours)
+
+        progress(state="done", done=done, total=total, seeded=seeded, errors=errors, hours=hours)
+        self.on_status(f"[События ершей] история {hours:g}ч: готово {seeded}/{total}, ошибок {errors}")
+        if on_done:
+            on_done(seeded)
+
+    def bootstrap_mexc_history(self, on_done=None):
+        """Заполнить историю MEXC минутными свечами за последний час.
+
+        Без этого вкладка "Ранние" мертва первый час после КАЖДОГО запуска
+        (метрики считаются из скользящей истории, которой ещё нет) — то есть
+        ни алертов, ни записи стаканов. Свечи дают ту же информацию сразу.
+
+        Хитрость с объёмом: живые опросы кладут в историю КУМУЛЯТИВНЫЙ объём за
+        24ч, а vol_60m считается как сумма его приростов. Свечи же дают объём
+        поминутно. Поэтому синтезируем кумулятивный ряд так, чтобы он ЗАКАНЧИВАЛСЯ
+        на текущем 24-часовом объёме монеты — тогда первый живой замер даст
+        корректный прирост, а не гигантский скачок."""
+        try:
+            self.binance_spot_symbols = fetch_binance_spot_symbols()
+            self.on_status(f"[Ранние] спот Binance: {len(self.binance_spot_symbols)} пар "
+                            f"(для фильтра эксклюзивности)")
+        except Exception as e:
+            # не критично: без этого списка фильтр просто мягче, монеты со
+            # спота Binance без фьючерса могут просочиться в вотч-лист
+            self.on_status(f"[Ранние] не удалось получить спот Binance: {e}")
+
+        try:
+            self.mexc_contract_size = fetch_mexc_contract_sizes()
+            self.on_status(f"[OI] размеры контрактов MEXC: {len(self.mexc_contract_size)}")
+        except Exception as e:
+            # не критично: без размеров контрактов OI не переведётся в USD,
+            # но ΔOI (по числу контрактов) всё равно посчитается
+            self.on_status(f"[OI] не удалось получить размеры контрактов: {e}")
+
+        try:
+            tickers = _fetch_mexc_spot()
+        except Exception as e:
+            self.on_status(f"[Ранние] не удалось получить список MEXC: {e}")
+            return
+
+        targets = [t for t in tickers
+                   if BOOTSTRAP_V24_MIN <= t["quote_volume"] <= BOOTSTRAP_V24_MAX]
+        self.on_status(f"[Ранние] прогрев по свечам: {len(targets)} монет...")
+
+        session = requests.Session()
+
+        def seed(ticker):
+            symbol = ticker["symbol"]
+            try:
+                r = session.get(MEXC_KLINES_URL,
+                                params={"symbol": symbol, "interval": "1m", "limit": 60},
+                                timeout=15)
+                if r.status_code != 200:
+                    return None
+                candles = r.json()
+            except Exception:
+                return None
+            if len(candles) < EARLY_MIN_SAMPLES:
+                return None
+
+            try:
+                per_minute = [(int(c[6]) / 1000.0, float(c[4]), float(c[7])) for c in candles]
+            except (IndexError, TypeError, ValueError):
+                return None
+
+            total = sum(v for _ts, _close, v in per_minute)
+            cum_end = ticker["quote_volume"]
+            entries, running = [], 0.0
+            for ts, close, vol in per_minute:
+                running += vol
+                entries.append((ts, close, cum_end - (total - running)))
+            return symbol, entries
+
+        seeded = 0
+        with ThreadPoolExecutor(max_workers=BOOTSTRAP_WORKERS) as pool:
+            for result in pool.map(seed, targets):
+                if self._stop:
+                    return
+                if not result:
+                    continue
+                symbol, entries = result
+                key = f"MEXC SPOT:{symbol}"
+                with self._lock:
+                    existing = self._history.get(key, deque())
+                    # живые замеры, успевшие прийти, обязаны остаться — свечи
+                    # только достраивают историю СЛЕВА (более старую часть)
+                    oldest_live = existing[0][0] if existing else float("inf")
+                    merged = deque(e for e in entries if e[0] < oldest_live)
+                    merged.extend(existing)
+                    self._history[key] = merged
+                seeded += 1
+
+        self.on_status(f"[Ранние] прогрев завершён: {seeded} монет готовы")
+        if on_done:
+            on_done(seeded)
+
+    @staticmethod
+    def early_candidates(tickers, exchange=None, exclude_majors=True,
+                          binance_spot_symbols=None):
+        """Монеты в состоянии "живой тишины" — вотч-лист для наблюдения за
+        стаканом. Это НЕ сигнал на вход: под профиль подходит ~5% рынка
+        (68 из 1380 на момент калибровки), а стреляют единицы. Задача этого
+        отбора — сузить рынок, чтобы дальше по кандидатам можно было физически
+        успевать опрашивать стаканы.
+
+        exclude_majors — выбросить монеты, торгующиеся на биржах первого
+        эшелона (MAJOR_EXCHANGES + спот Binance). Списки берутся из ТОГО ЖЕ
+        батча тикеров, который уже опрошен для всех бирж, поэтому фильтр не
+        стоит ни одного дополнительного запроса. Площадки второго эшелона
+        (AsterDEX, Gate) дисквалификацией не считаются — там такие монеты и
+        живут; они лишь помечаются в поле also_on."""
+        major = set()
+        others = {}  # symbol -> список прочих бирж, где монета тоже есть
+        for t in tickers:
+            symbol, exch = t.get("symbol"), t.get("exchange")
+            if exch in MAJOR_EXCHANGES:
+                major.add(symbol)
+            if exch != exchange:
+                others.setdefault(symbol, []).append(exch)
+        if binance_spot_symbols:
+            major |= binance_spot_symbols
+
+        out = []
+        for t in tickers:
+            if exchange and t.get("exchange") != exchange:
+                continue
+            if not t.get("early_ready"):
+                continue
+            if exclude_majors and t.get("symbol") in major:
+                continue
+            if not (EARLY_RANGE_MIN_PCT <= t.get("range_60m", 0.0) <= EARLY_RANGE_MAX_PCT):
+                continue
+            if not (EARLY_VOL_MIN_USD <= t.get("vol_60m", 0.0) <= EARLY_VOL_MAX_USD):
+                continue
+            if t.get("vol_accel", 0.0) >= EARLY_ACCEL_MAX:
+                continue
+            t["also_on"] = sorted(others.get(t.get("symbol"), []))
+            out.append(t)
+        # растущий OI — бонус: такие монеты всплывают в начало списка (трейдеры
+        # уже открывают позиции), внутри группы — по сжатости диапазона.
+        # Спотовые без OI не проигрывают ничего, кроме этого бонуса.
+        return sorted(out, key=lambda x: (
+            0 if x.get("oi_change_pct", 0.0) >= OI_RISE_HIGHLIGHT_PCT else 1,
+            x["range_60m"]))
+
     @staticmethod
     def top_movers(tickers, n=TOP_N):
         """Возвращает (топ роста, топ падения) — n записей каждый, по change_pct_24h."""
@@ -298,3 +1084,65 @@ class MarketScanner:
         точек истории) записи."""
         ready = [t for t in tickers if t.get("hh_ready")]
         return sorted(ready, key=lambda t: t["hh_range_pct"])[:n]
+
+    @staticmethod
+    def hedgehog_event_candidates(tickers, n=30, exchanges=HEDGEHOG_EVENT_EXCHANGES,
+                                  max_range_pct=HEDGEHOG_EVENT_MAX_RANGE_PCT,
+                                  min_needles=HEDGEHOG_EVENT_MIN_NEEDLES):
+        """Кандидаты для ленты событий "ершей": цена уже прогрета, держится в
+        узком диапазоне и несколько раз сходила от одной границы к другой.
+
+        Это не поиск пробоя. Здесь фиксируется само состояние "ходит туда-сюда"
+        внутри диапазона, чтобы GUI мог отдельно проверить стакан и дать
+        уведомление только по нужным биржам."""
+        allowed = set(exchanges or [])
+        out = []
+        for t in tickers:
+            if allowed and t.get("exchange") not in allowed:
+                continue
+            if not t.get("hh_ready"):
+                continue
+            range_pct = float(t.get("hh_range_pct", 0.0) or 0.0)
+            if range_pct <= 0 or range_pct > max_range_pct:
+                continue
+            if int(t.get("hh_needle_count", 0) or 0) < min_needles:
+                continue
+            if t.get("hh_low", 0.0) <= 0 or t.get("hh_high", 0.0) <= 0:
+                continue
+            out.append(t)
+
+        def score(t):
+            # Больше переходов внутри более узкого диапазона — интереснее.
+            return (
+                -int(t.get("hh_needle_count", 0) or 0),
+                float(t.get("hh_range_pct", 0.0) or 0.0),
+                -float(t.get("quote_volume", 0.0) or 0.0),
+            )
+
+        return sorted(out, key=score)[:n]
+
+    @staticmethod
+    def spike_reversal_candidates(tickers, n=50, exchanges=SPIKE_REVERSAL_EXCHANGES,
+                                  min_count=SPIKE_REVERSAL_MIN_COUNT, sides=None):
+        allowed = set(exchanges or [])
+        allowed_sides = set(sides or ("down", "up"))
+        out = []
+        for t in tickers:
+            if allowed and t.get("exchange") not in allowed:
+                continue
+            if not t.get("rev_ready"):
+                continue
+            if int(t.get("rev_count", 0) or 0) < min_count:
+                continue
+            if t.get("rev_last_side") not in allowed_sides:
+                continue
+            out.append(t)
+
+        def score(t):
+            return (
+                -float(t.get("rev_last_ts", 0.0) or 0.0),
+                -int(t.get("rev_count", 0) or 0),
+                -float(t.get("rev_best_move_pct", 0.0) or 0.0),
+            )
+
+        return sorted(out, key=score)[:n]

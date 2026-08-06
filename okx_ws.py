@@ -23,7 +23,7 @@ REST_INSTRUMENTS = "https://www.okx.com/api/v5/public/instruments"
 PING_INTERVAL_SEC = 20
 
 
-def to_okx_symbol(symbol: str) -> str:
+def to_okx_swap_symbol(symbol: str) -> str:
     """LABUSDT -> LAB-USDT-SWAP (предполагаем бессрочник в USDT)."""
     symbol = symbol.upper()
     if symbol.endswith("USDT"):
@@ -31,14 +31,39 @@ def to_okx_symbol(symbol: str) -> str:
     return symbol
 
 
+def to_okx_spot_symbol(symbol: str) -> str:
+    """LABUSDT -> LAB-USDT."""
+    symbol = symbol.upper()
+    if symbol.endswith("USDT"):
+        return f"{symbol[:-4]}-USDT"
+    return symbol
+
+
 def from_okx_symbol(inst_id: str) -> str:
     return inst_id.replace("-SWAP", "").replace("-", "").upper()
 
 
+OKX_CONFIGS = {
+    "OKX": {
+        "label": "OKX",
+        "inst_type": "SWAP",
+        "to_symbol": to_okx_swap_symbol,
+    },
+    "OKX SPOT": {
+        "label": "OKX Spot",
+        "inst_type": "SPOT",
+        "to_symbol": to_okx_spot_symbol,
+    },
+}
+
+
 class OKXWSManager:
-    def __init__(self, on_depth_update, on_status):
-        self.exchange = "OKX"
-        self.label = "OKX"
+    def __init__(self, on_depth_update, on_status, exchange="OKX"):
+        cfg = OKX_CONFIGS[exchange]
+        self.exchange = exchange
+        self.label = cfg["label"]
+        self.inst_type = cfg["inst_type"]
+        self.to_symbol = cfg["to_symbol"]
         self.on_depth_update = on_depth_update  # callback(exchange, symbol, {"b":[(p,q)],"a":[(p,q)],"snapshot":bool})
         self.on_status = on_status
         self.loop = None
@@ -46,7 +71,7 @@ class OKXWSManager:
         self.ws = None
         self._stop = False
         self._lock = threading.Lock()
-        self._desired = set()  # inst_id (LAB-USDT-SWAP)
+        self._desired = set()  # inst_id (LAB-USDT-SWAP или LAB-USDT)
 
     # ---------- публичное API ----------
 
@@ -63,14 +88,14 @@ class OKXWSManager:
                 pass
 
     def subscribe_symbol(self, symbol: str):
-        inst_id = to_okx_symbol(symbol)
+        inst_id = self.to_symbol(symbol)
         with self._lock:
             self._desired.add(inst_id)
         if self.loop:
             asyncio.run_coroutine_threadsafe(self._subscribe([inst_id]), self.loop)
 
     def unsubscribe_symbol(self, symbol: str):
-        inst_id = to_okx_symbol(symbol)
+        inst_id = self.to_symbol(symbol)
         with self._lock:
             self._desired.discard(inst_id)
         if self.loop:
@@ -166,10 +191,11 @@ class OKXWSManager:
             await self.ws.close()
 
 
-def validate_symbol(symbol: str) -> bool:
-    inst_id = to_okx_symbol(symbol)
+def validate_symbol(symbol: str, exchange="OKX") -> bool:
+    cfg = OKX_CONFIGS[exchange]
+    inst_id = cfg["to_symbol"](symbol)
     try:
-        resp = requests.get(REST_INSTRUMENTS, params={"instType": "SWAP", "instId": inst_id}, timeout=10)
+        resp = requests.get(REST_INSTRUMENTS, params={"instType": cfg["inst_type"], "instId": inst_id}, timeout=10)
         resp.raise_for_status()
         return bool(resp.json().get("data"))
     except Exception:
