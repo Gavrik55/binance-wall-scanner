@@ -25,6 +25,7 @@ from ws_manager import (
 )
 from gate_ws import GateWSManager, validate_symbol as gate_validate_symbol
 from okx_ws import OKXWSManager, validate_symbol as okx_validate_symbol
+from bitget_ws import BitgetWSManager, validate_symbol as bitget_validate_symbol
 from rest_poll_manager import (
     REST_EXCHANGES,
     RestPollingManager,
@@ -80,7 +81,7 @@ SPOT_EXCHANGE_BY_BASE = {
     "OKX": "OKX SPOT",
     "MEXC": "MEXC SPOT",
 }
-EXTRA_EXCHANGE_CHOICES = ["BINANCE ALPHA"]
+EXTRA_EXCHANGE_CHOICES = ["BINANCE ALPHA", "BITGET SPOT"]  # спот-биржи без фьючерсной пары в скринере
 EXCHANGE_CHOICES = BASE_EXCHANGE_CHOICES + list(SPOT_EXCHANGE_BY_BASE.values()) + EXTRA_EXCHANGE_CHOICES
 BINANCE_STYLE = {"BINANCE", "ASTERDEX", "BINANCE SPOT", "ASTERDEX SPOT"}  # Binance-style diff (U/u/pu)
 REST_POLLING_EXCHANGES = set(REST_EXCHANGES)
@@ -106,6 +107,7 @@ EXCHANGE_SHORT_LABELS = {
     "OKX SPOT": "OKX S",
     "MEXC": "MEXC",
     "MEXC SPOT": "MEXC S",
+    "BITGET SPOT": "BITG S",
 }
 CTRL_MASK = 0x0004
 HOTKEY_KEYCODES = {
@@ -146,6 +148,7 @@ LABEL_TO_EXCHANGE = {
     "MEXC": "MEXC",
     "MEXC Spot": "MEXC SPOT",
     "Binance Alpha": "BINANCE ALPHA",
+    "Bitget Spot": "BITGET SPOT",
 }
 
 # состояние индикатора подключения -> (иконка, цвет, текст)
@@ -1616,6 +1619,8 @@ class App:
             mgr = GateWSManager(self._on_depth_update, self._on_status, exchange=exchange)
         elif exchange.startswith("OKX"):
             mgr = OKXWSManager(self._on_depth_update, self._on_status, exchange=exchange)
+        elif exchange.startswith("BITGET"):
+            mgr = BitgetWSManager(self._on_depth_update, self._on_status, exchange=exchange)
         elif exchange in REST_POLLING_EXCHANGES:
             mgr = RestPollingManager(exchange, self._on_depth_update, self._on_status)
         else:
@@ -1631,6 +1636,8 @@ class App:
             return lambda s: gate_validate_symbol(s, exchange=exchange)
         if exchange.startswith("OKX"):
             return lambda s: okx_validate_symbol(s, exchange=exchange)
+        if exchange.startswith("BITGET"):
+            return lambda s: bitget_validate_symbol(s, exchange=exchange)
         if exchange in REST_POLLING_EXCHANGES:
             return lambda s: validate_rest_symbol(exchange, s)
         return lambda s: True
