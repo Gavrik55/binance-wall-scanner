@@ -50,6 +50,7 @@ from market_scan import (
     OI_RISE_HIGHLIGHT_PCT,
 )
 from depth_recorder import DepthRecorder
+from uptick_monitor import UptickMonitor
 
 # В обычном запуске (python main.py) конфиг лежит рядом со скриптом.
 # В собранном PyInstaller-экзешнике __file__ указывает во временную папку
@@ -293,6 +294,7 @@ MAX_PRINT_ROWS = 200
 EARLY_CONFIRM_TICKS = 3
 EARLY_REALERT_SEC = 3 * 3600     # повторный алерт по той же монете — не раньше чем через 3ч
 EARLY_DEPTH_DIR = os.path.join(_APP_DIR, "depth_data")
+UPTICK_RECORD_DIR = os.path.join(_APP_DIR, "uptick_records")
 
 
 _CHIME_CACHE = {}  # freq -> готовый WAV (bytes), чтобы не пересинтезировать на каждый алерт
@@ -413,6 +415,14 @@ class App:
         self._early_alerted = {}    # symbol -> когда последний раз алертили (антиповтор)
         self.depth_recorder = DepthRecorder(EARLY_DEPTH_DIR, self._on_status)
 
+        # "⚡ Аптики" — limit up/down по OKX+Bybit (плотность у спреда + замолчавшая
+        # сторона ленты). ВЫКЛ по умолчанию: тикеры Bybit тяжёлые (~586 КБ/опрос),
+        # включается галкой на вкладке, когда пользователь готов к трафику.
+        self.uptick_enabled = tk.BooleanVar(value=False)
+        self.uptick_popup_enabled = tk.BooleanVar(value=True)
+        self.uptick_monitor = UptickMonitor(self._on_uptick, self._on_status,
+                                            record_dir=UPTICK_RECORD_DIR)
+
         self._build_ui()
         self.root.bind_all("<KeyPress>", self._on_global_keypress, add="+")
         self._load_config()
@@ -437,6 +447,10 @@ class App:
         # запись стаканов по вотч-листу — единственный способ получить историю
         # стакана перед пампом, её нельзя добрать задним числом (см. depth_recorder.py)
         self.depth_recorder.start()
+
+        # монитор аптиков крутится в фоне, но пока enabled=False — спит и трафик
+        # не тратит (включается галкой на вкладке "⚡ Аптики")
+        self.uptick_monitor.start()
 
         # прогрев "Ранних" минутными свечами: без него вкладка пустая первый час
         # после каждого запуска, то есть ни алертов, ни записи стаканов
@@ -463,10 +477,12 @@ class App:
         tab_movers = tk.Frame(self.notebook, bg="#0a0a0d")
         tab_hedgehog = tk.Frame(self.notebook, bg="#0a0a0d")
         tab_early = tk.Frame(self.notebook, bg="#0a0a0d")
+        tab_uptick = tk.Frame(self.notebook, bg="#0a0a0d")
         self.notebook.add(tab_scanner, text="Сканер плотностей")
         self.notebook.add(tab_movers, text="Топ движений")
         self.notebook.add(tab_hedgehog, text="🦔 Ерши")
         self.notebook.add(tab_early, text="🎯 Ранние")
+        self.notebook.add(tab_uptick, text="⚡ Аптики")
 
         top = tk.Frame(tab_scanner, bg="#0a0a0d")
         top.pack(fill="x", padx=10, pady=(10, 4))
@@ -718,6 +734,7 @@ class App:
         self._build_movers_tab(tab_movers)
         self._build_hedgehog_tab(tab_hedgehog)
         self._build_early_tab(tab_early)
+        self._build_uptick_tab(tab_uptick)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(10, 0))
 
         status_bar = tk.Label(self.root, textvariable=self.status_var,
@@ -1885,6 +1902,8 @@ class App:
                     self._update_movers_trees(item[1])
                 elif kind == "HEDGEHOG":
                     self._update_hedgehog_tree(item[1])
+                elif kind == "UPTICK":
+                    self._render_uptick(item[1])
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
@@ -2270,6 +2289,100 @@ class App:
             toast.destroy()
         self._reposition_impulse_toasts()
 
+    # ---------------- ⚡ Аптики (limit up/down) ----------------
+
+    def _build_uptick_tab(self, parent):
+        """Вкладка «⚡ Аптики»: limit up/down по OKX+Bybit. Сигнал (правило R3,
+        откалибровано на реальной записи DOS): аномально крупная плотность у
+        спреда + одна сторона рыночных сделок замолчала (заявки в неё не
+        проходят). ВЫКЛ по умолчанию — тикеры Bybit тяжёлые, включаешь галкой."""
+        bar = tk.Frame(parent, bg="#0a0a0d")
+        bar.pack(fill="x", padx=4, pady=(8, 4))
+        tk.Checkbutton(bar, text="⚡ Включить монитор аптиков (OKX+Bybit)",
+                        variable=self.uptick_enabled, command=self._toggle_uptick,
+                        bg="#0a0a0d", fg="white", selectcolor="#131316",
+                        activebackground="#0a0a0d", activeforeground="white").pack(side="left")
+        tk.Checkbutton(bar, text="🔔 Всплывашка", variable=self.uptick_popup_enabled,
+                        bg="#0a0a0d", fg="white", selectcolor="#131316",
+                        activebackground="#0a0a0d", activeforeground="white").pack(side="left", padx=(12, 0))
+        tk.Label(bar, text="⚠ трафик ~0.5 ГБ/час (тяжёлые тикеры Bybit); включай, когда нужен",
+                 bg="#0a0a0d", fg="#6b7078", font=("Segoe UI", 9)).pack(side="left", padx=16)
+
+        tk.Label(parent, text="Сигнал: крупная плотность у спреда (≥×20 от нормы) + замолчавшая "
+                              "сторона ленты. Событие пишется в uptick_records/. Двойной клик — копировать тикер.",
+                 bg="#0a0a0d", fg="#6b7078", font=("Segoe UI", 9), justify="left").pack(anchor="w", padx=4, pady=(0, 4))
+
+        ucols = ("time", "exchange", "symbol", "side", "ratio", "blocked", "move", "price")
+        uheaders = {"time": "Время", "exchange": "Биржа", "symbol": "Символ", "side": "Плотность",
+                    "ratio": "× нормы", "blocked": "Отключены", "move": "Движ.", "price": "Цена"}
+        uwidths = {"time": 70, "exchange": 70, "symbol": 130, "side": 80,
+                   "ratio": 70, "blocked": 130, "move": 70, "price": 100}
+        frame = tk.Frame(parent, bg="#0a0a0d")
+        frame.pack(fill="both", expand=True, padx=4, pady=(0, 8))
+        self.uptick_tree = ttk.Treeview(frame, columns=ucols, show="headings")
+        for c in ucols:
+            self.uptick_tree.heading(c, text=uheaders[c])
+            self.uptick_tree.column(c, width=uwidths[c], anchor="center")
+        self.uptick_tree.tag_configure("up", foreground=SIDE_COLOR["bid"])
+        self.uptick_tree.tag_configure("down", foreground=SIDE_COLOR["ask"])
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.uptick_tree.yview)
+        self.uptick_tree.configure(yscrollcommand=scroll.set)
+        self.uptick_tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.uptick_tree.bind("<Double-1>", lambda e: self._copy_symbol_from_tree(self.uptick_tree, 2))
+
+    def _toggle_uptick(self):
+        on = self.uptick_enabled.get()
+        self.uptick_monitor.set_enabled(on)
+        self.status_var.set("⚡ Монитор аптиков включён (OKX+Bybit)" if on else "⚡ Монитор аптиков выключен")
+
+    def _on_uptick(self, event):
+        # вызывается из фонового потока UptickMonitor — кладём в очередь
+        self.event_queue.put(("UPTICK", event))
+
+    def _render_uptick(self, ev):
+        blocked = f"рыночные {ev['blocked']}"
+        tag = "down" if ev["blocked"] == "покупки" else "up"
+        ts = datetime.fromtimestamp(ev["ts"]).strftime("%H:%M:%S")
+        self.uptick_tree.insert("", 0, values=(
+            ts, ev["exchange"], ev["symbol"], ev["side"], f"×{ev['ratio']:.0f}",
+            blocked, f"{ev['move_pct']:+.1f}%", f"{ev['price']:g}",
+        ), tags=(tag,))
+        children = self.uptick_tree.get_children()
+        if len(children) > 300:
+            self.uptick_tree.delete(children[-1])
+        if self.uptick_popup_enabled.get():
+            self._show_uptick_toast(ev)
+        if self.impulse_sound_enabled.get():
+            threading.Thread(target=_play_beep, args=("WALL",), daemon=True).start()
+
+    def _show_uptick_toast(self, ev):
+        color = SIDE_COLOR["ask"] if ev["blocked"] == "покупки" else SIDE_COLOR["bid"]
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        toast.configure(bg=color)
+        inner = tk.Frame(toast, bg="#1f1f24")
+        inner.pack(fill="both", expand=True, padx=2, pady=2)
+        tk.Label(inner, text=f"⚡ Аптик  {ev['exchange']}  {ev['symbol']}", bg="#1f1f24", fg=color,
+                 font=("Segoe UI", 10, "bold"), anchor="w").pack(fill="x", padx=10, pady=(8, 0))
+        tk.Label(inner, text=f"плотность {ev['side']} ×{ev['ratio']:.0f} · рыночные {ev['blocked']} отключены",
+                 bg="#1f1f24", fg="white", font=("Segoe UI", 9), anchor="w").pack(fill="x", padx=10, pady=(0, 8))
+
+        def _on_click(_e=None):
+            self.notebook.select(5)  # вкладка "⚡ Аптики"
+            self.root.clipboard_clear()
+            self.root.clipboard_append(ev["symbol"])
+            self.status_var.set(f"Аптик: {ev['symbol']} скопирован в буфер")
+            self._remove_impulse_toast(toast)
+
+        toast.bind("<Button-1>", _on_click)
+        for w in (inner, *inner.winfo_children()):
+            w.bind("<Button-1>", _on_click)
+        self._active_impulse_toasts.append(toast)
+        self._reposition_impulse_toasts()
+        toast.after(IMPULSE_TOAST_MS, lambda: self._remove_impulse_toast(toast))
+
     def _go_to_movers_tab(self, key):
         self.notebook.select(1)  # 0=Сканер плотностей, 1=Топ движений, 2=Ерши
         exchange, symbol = key.split(":", 1)
@@ -2550,6 +2663,7 @@ class App:
         self.market_scanner.stop()
         self.hedgehog_scanner.stop()
         self.depth_recorder.stop()
+        self.uptick_monitor.stop()
         self._save_config()
         self._save_impulse_settings()
         self._save_print_settings()
